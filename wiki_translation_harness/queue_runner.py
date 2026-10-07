@@ -18,6 +18,7 @@ from wiki_translation_harness.config import Config
 from wiki_translation_harness.progress import ProgressReporter
 from wiki_translation_harness.sources import ArticleInput, parse_source_ref
 from wiki_translation_harness.statistics import StatsTracker
+from wiki_translation_harness.resume import unfinished_inputs
 
 logger = logging.getLogger("wiki_translation_harness.queue_runner")
 
@@ -58,6 +59,18 @@ async def run_queue_mode(
     stats = stats_tracker.stats
     processed = 0
 
+    # Retry the local backlog before claiming fresh shared-queue work. Disable
+    # discovery below so a failed retry is attempted only once in this run.
+    backlog = unfinished_inputs(config, [])[:max_articles]
+    if backlog:
+        logger.info("Retrying %d unfinished local article(s) before claiming queue work", len(backlog))
+        reporter = ProgressReporter(stats, config.workers, on_event=logger.info)
+        await run_pipeline(
+            config.model_copy(update={"sequential": True}), backlog,
+            reporter=reporter, stats_tracker=stats_tracker, resume_unfinished=False,
+        )
+        processed += len(backlog)
+
     while processed < max_articles:
         claimed = queue_lib.claim_next_pending(queue_repo_dir, stale_hours=stale_hours)
         if claimed is None:
@@ -82,6 +95,7 @@ async def run_queue_mode(
                 force=True,  # the queue is the source of truth for done/failed, not output_dir presence
                 reporter=reporter,
                 stats_tracker=article_stats,
+                resume_unfinished=False,
             )
         except Exception as exc:  # noqa: BLE001 - must still record FAILED and move on to the next article
             logger.exception("Queue article %s crashed", url)

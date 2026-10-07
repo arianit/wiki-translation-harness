@@ -66,6 +66,9 @@ class ArticleReportData:
     chunks: list[Chunk]
     facts: VerifiedFacts
     citation_languages_filled: dict[str, str] = field(default_factory=dict)
+    # Comments the model wrote itself (comments.reconcile_comments), removed
+    # from the article.
+    removed_comments: list[str] = field(default_factory=list)
     # Set only when the run's semantic review pass (pipeline.run_review_pass)
     # was enabled for this article. review_findings is whatever remained
     # unresolved after its repair-attempt cap -- empty means either the
@@ -181,6 +184,16 @@ def build_article_report(data: ArticleReportData, assembled_text: str) -> str:
         )
         for title, lang in sorted(data.citation_languages_filled.items()):
             lines.append(f"- `{lang}` — {title}")
+        lines.append("")
+
+    if data.removed_comments:
+        lines.append("## Model notes removed from the article\n")
+        lines.append(
+            "The model left these as HTML comments; none matches a comment in the "
+            "source, so they were removed. Some say what it left out or couldn't fix.\n"
+        )
+        for body in data.removed_comments:
+            lines.append(f"- {' '.join(body.split())}")
         lines.append("")
 
     repaired = [c for c in data.chunks if c.status == ChunkStatus.REPAIRED]

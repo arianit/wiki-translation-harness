@@ -86,6 +86,24 @@ def _find_protected_spans(text: str) -> list[tuple[int, int]]:
             tag_name = str(getattr(node, "tag", "")).lower()
             if tag_name in ("table", "ref"):
                 spans.append((offset, offset + len(s)))
+            elif tag_name == "references" and node.contents is not None:
+                # A list-defined <references> block is one top-level node,
+                # usually far too big to protect whole — but its inner
+                # <ref> definitions must still never be cut. Unprotected,
+                # the sentence splitter split `... p. 23.</ref>` after
+                # "p.", the model dropped the stray `</ref>` opening the
+                # next chunk, and the unclosed definition swallowed the
+                # following one (Albert Einstein, ref "iJwuX").
+                inner = str(node.contents)
+                inner_offset = offset + s.find(inner) if inner else offset
+                for child in node.contents.nodes:
+                    cs = str(child)
+                    if type(child).__name__ == "Template" or (
+                        type(child).__name__ == "Tag"
+                        and str(getattr(child, "tag", "")).lower() == "ref"
+                    ):
+                        spans.append((inner_offset, inner_offset + len(cs)))
+                    inner_offset += len(cs)
         offset += len(s)
 
     spans.extend(_find_list_spans(text))

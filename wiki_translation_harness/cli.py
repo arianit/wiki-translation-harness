@@ -141,7 +141,7 @@ def main(
         help="'claude_code' (default, uses your Claude Code CLI login, no API key), "
         "'openrouter', 'local' (any OpenAI-compatible server), 'experiential' "
         "(platform.experientiallabs.ai), or 'opencode_go' (runs the `opencode` CLI "
-        "under its own separate login/session)",
+        "under its own separate login/session), or 'codex' (ChatGPT subscription login)",
     ),
     fallback_provider: Optional[str] = typer.Option(
         None, "--fallback-provider",

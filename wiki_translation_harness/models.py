@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Shared between Config.provider and Config.fallback_provider's validators
 # so the two lists of accepted engine names can't drift apart.
-_VALID_PROVIDERS = ("openrouter", "local", "claude_code", "experiential", "opencode_go")
+_VALID_PROVIDERS = ("openrouter", "local", "claude_code", "experiential", "opencode_go", "codex")
 
 # The `claude` CLI's own accepted --effort values (confirmed via `claude -p
 # --help`), matching the Messages API's output_config.effort levels.
@@ -298,7 +298,11 @@ class Config(BaseModel):
     # claude_code); set equal to `provider` to disable the offer entirely.
     # See pipeline.py's ensure_fallback_engine().
     fallback_provider: str | None = None
-    model: str = "claude-sonnet-5"
+    fallback_model: str | None = None
+    # Explicit opt-in for automatic switching even during interactive runs.
+    fallback_auto_switch: bool = False
+    codex_cli_path: str = "codex"
+    model: str = "claude-sonnet-5-5"
     # When set, complex chunks (Infoboxes, large tables, dense ref lists)
     # are routed to this model instead of `model` — a hybrid strategy that
     # uses a cheaper/faster model for ~80% of standard body text while
@@ -363,6 +367,10 @@ class Config(BaseModel):
     live_validate: bool = True
     live_validate_timeout_s: float = 30.0
     max_assembly_repair_rounds: int = 3
+    # Chunks repaired at once within one assembly-repair round. A round on
+    # a long article can touch ~20 chunks; repaired one at a time that is
+    # ~15 minutes per round.
+    assembly_repair_concurrency: int = 4
 
     source_lang: str = "en"
     target_lang: str = "sq"
@@ -528,7 +536,7 @@ class Config(BaseModel):
     # a lot of extra token spend on this workload. One client (and setting)
     # per provider (see engines.build_client_pool), so this applies to
     # every model routed through provider: claude_code in a given run --
-    # currently always claude-sonnet-5 by default (config.default_model_for_provider).
+    # currently always claude-sonnet-5-5 by default (config.default_model_for_provider).
     # None omits the flag, letting the CLI use its own default (currently "high").
     claude_code_effort: str | None = "medium"
     # Sized for the largest oversized-section chunks (never split further,
@@ -592,7 +600,7 @@ class Config(BaseModel):
         if v not in _VALID_PROVIDERS:
             raise ValueError(
                 "provider must be 'openrouter', 'local', 'claude_code', 'experiential', "
-                f"or 'opencode_go', got {v!r}"
+                f"or 'opencode_go' or 'codex', got {v!r}"
             )
         return v
 
@@ -602,7 +610,7 @@ class Config(BaseModel):
         if v is not None and v not in _VALID_PROVIDERS:
             raise ValueError(
                 "fallback_provider must be 'openrouter', 'local', 'claude_code', "
-                f"'experiential', or 'opencode_go', got {v!r}"
+                f"'experiential', or 'opencode_go' or 'codex', got {v!r}"
             )
         return v
 
@@ -612,7 +620,7 @@ class Config(BaseModel):
         if v is not None and v not in _VALID_PROVIDERS:
             raise ValueError(
                 "complex_provider/review_provider must be 'openrouter', 'local', "
-                f"'claude_code', 'experiential', or 'opencode_go', got {v!r}"
+                f"'claude_code', 'experiential', or 'opencode_go' or 'codex', got {v!r}"
             )
         return v
 

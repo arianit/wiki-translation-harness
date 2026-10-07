@@ -21,8 +21,10 @@ def default_model_for_provider(provider: str) -> str:
     """Same provider-appropriate default build_config() picks when nothing
     else sets `model` — factored out so a mid-run fallback-provider switch
     (pipeline.py) can pick a sane model for the new provider too."""
+    if provider == "codex":
+        return "gpt-6-luna"
     if provider == "claude_code":
-        return "claude-sonnet-5"
+        return "claude-sonnet-5-5"
     if provider == "experiential":
         # Matches Experiential Labs' own curated-catalog example model id
         # (platform.experientiallabs.ai/docs) rather than assuming its

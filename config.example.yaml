@@ -14,7 +14,7 @@
 # `--provider experiential` / `--provider opencode_go`; --model and
 # --workers work the same across all five. If you switch provider without
 # also setting model below, config.py picks a provider-appropriate default
-# (claude-sonnet-5 for claude_code, qwen3.8-27b for experiential, "auto"
+# (claude-sonnet-5-5 for claude_code, qwen3.8-27b for experiential, "auto"
 # meaning "let opencode pick" for opencode_go, deepseek/deepseek-v3.2
 # otherwise) rather than silently reusing whatever model id you had for the
 # other provider.
@@ -29,6 +29,10 @@ provider: claude_code
 # limit), otherwise claude_code; set this to pick a different one, or to
 # `provider`'s own value to disable the offer entirely.
 # fallback_provider: opencode_go
+# Efficient OpenAI subscription fallback (sign in with `codex login`):
+# fallback_provider: codex
+# fallback_model: gpt-6-luna
+# fallback_auto_switch: true
 # No `model:` here either, for the same reason -- let it auto-derive.
 workers: 2
 sequential: true
@@ -49,7 +53,7 @@ max_repair_attempts: 2
 # complex_provider only needs setting when it should differ from
 # `provider` above; unset, complex chunks just use a different model on
 # the same client.
-# complex_model: claude-sonnet-5
+# complex_model: claude-sonnet-5-5
 # complex_provider: claude_code
 #
 # review_model: an independent semantic-fidelity pass over the whole
@@ -60,7 +64,7 @@ max_repair_attempts: 2
 # complex_model is set); review_provider defaults to complex_provider,
 # then provider. Unresolved findings after review_max_repair_attempts
 # don't block delivery -- see review_queue.record_review_flags.
-# review_model: claude-sonnet-5
+# review_model: claude-sonnet-5-5
 # review_provider: claude_code
 # review_max_repair_attempts: 2
 #
@@ -70,7 +74,7 @@ max_repair_attempts: 2
 # left unset so it inherits complex_model/complex_provider):
 #   provider: opencode_go
 #   model: opencode-go/deepseek-v4.1-flash   # confirm against `opencode models` -- catalog depends on your own opencode auth
-#   complex_model: claude-sonnet-5
+#   complex_model: claude-sonnet-5-5
 #   complex_provider: claude_code
 #   fallback_provider: claude_code   # auto-switch target if opencode_go hits its own session/rate limit
 
@@ -220,6 +224,7 @@ generate_reports: true
 live_validate: true
 live_validate_timeout_s: 30
 max_assembly_repair_rounds: 3
+assembly_repair_concurrency: 4  # chunks repaired in parallel per round
 
 # Fills any citation missing |language= in the final assembled article, and
 # renames citation parameter *names* mistranslated into the target language

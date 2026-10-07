@@ -20,6 +20,14 @@ repairs, caches, verifies facts, and saves. It never publishes anything.
    the translation-memory cache are reused.
 4. Validate each chunk. On a defect, ask the model to repair it; if repair
    fails, the article fails and is not saved (partial progress is kept).
+   Before starting new translations, the harness retries unfinished articles
+   from `partial_output_dir`, one at a time, reusing matching cached sections.
+   Each unfinished article gets one attempt per run before new work begins,
+   including with `--no-sequential`. Queue mode retries this local backlog
+   before claiming new articles, counting retries toward `--max-articles`.
+   New checkpoints preserve source language and local input paths; older
+   partial drafts use a matching requested input or infer the title from the
+   filename with the configured source language.
 5. Assemble the article, apply deterministic fixes, validate it again
    (statically and by rendering it through the target wiki's parse API),
    and write the `.wiki` file plus a report.
@@ -185,7 +193,7 @@ Choose with `--provider` or `provider:` in config.yaml:
 | `opencode_go` | `opencode run` with its own login | no | real per-call tokens and cost |
 
 If you change `--provider` without `--model`, a default model for that
-provider is picked (`claude-sonnet-5`, `deepseek/deepseek-v3.2`,
+provider is picked (`claude-sonnet-5-5`, `deepseek/deepseek-v3.2`,
 `qwen3.8-27b`, or, for `opencode_go`, whatever opencode is configured to
 use).
 
@@ -223,6 +231,29 @@ The target is `--fallback-provider`. By default it is `opencode_go` when
 running on `claude_code`, otherwise `claude_code`. Set it equal to
 `--provider` to disable the switch.
 
+To automatically continue with an efficient OpenAI subscription model after Claude's
+session limit, set these in `config.yaml`:
+
+```yaml
+fallback_provider: codex
+fallback_model: gpt-6-luna
+fallback_auto_switch: true
+```
+
+Sign in using `codex login` with your ChatGPT Pro account. The harness
+checks that login is ChatGPT-based and refuses API-key authentication.
+GPT-6 Luna is OpenAI's efficient model for focused, high-volume tasks;
+Albanian translations still need human review. Existing validation and
+repair run as before. The Codex engine uses an isolated temporary working
+directory and a read-only sandbox, with shell tools disabled.
+
+`fallback_model` can pin another model; omitted, the target provider's
+default is used. `fallback_auto_switch` defaults to false, preserving the
+interactive prompt. Explicit complex/review tiers retain their own routing.
+You can also use `--provider codex --model gpt-6-luna` directly.
+If the OpenAI subscription is also exhausted, the chunk fails rather than
+silently switching to paid API usage.
+
 ## Model tiers
 
 All optional. With none set, one model does everything.
@@ -257,7 +288,7 @@ wiki-translation-harness queue --provider openrouter --model deepseek/deepseek-v
 Each run pulls the queue repo, claims the first unclaimed line (commits and
 pushes the claim first, so two machines don't take the same article),
 translates it, then marks it `DONE` or `FAILED` along with the engine that
-actually ran (e.g. `DONE\tclaude-sonnet-5@claude_code`). A claim older than
+actually ran (e.g. `DONE\tclaude-sonnet-5-5@claude_code`). A claim older than
 `--stale-hours` (default 3) is treated as abandoned. The clone location is
 `--queue-repo-dir` (default `~/code/wiki-translation-queue`).
 

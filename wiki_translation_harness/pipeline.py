@@ -15,6 +15,7 @@ import time
 import httpx
 
 from wiki_translation_harness.cache import TranslationCache, VerificationCache, compute_key
+from wiki_translation_harness.resume import checkpoint_input, unfinished_inputs, input_key
 from wiki_translation_harness.config import (
     default_model_for_provider,
     resolve_complex_provider,
@@ -22,16 +23,20 @@ from wiki_translation_harness.config import (
     resolve_review_provider,
 )
 from wiki_translation_harness.engines import LLMEngineClient, build_client_pool, build_llm_client
+from wiki_translation_harness.comments import reconcile_chunk_comments
 from wiki_translation_harness.citation_language import (
     dedupe_short_footnotes,
     fill_missing_citation_languages,
     fix_citation_param_names,
+    convert_nested_ref_notes_to_refn,
+    convert_nested_sfn_to_harvnb,
     fix_sfn_param_names,
     unwrap_redundant_sfn_ref,
 )
 from wiki_translation_harness.report import build_attribution_block
 from wiki_translation_harness.live_validator import validate_wikitext_live
 from wiki_translation_harness.mediawiki import MediaWikiClient, MediaWikiClientPool
+from wiki_translation_harness.notes import expand_cref_notes
 from wiki_translation_harness.models import (
     ArticleSource,
     Chunk,
@@ -168,6 +173,417 @@ def normalize_quote_templates(text: str) -> str:
     return _QUOTE_TEMPLATE_RE.sub(r"\g<1>", text)
 
 
+_REFERENCES_OPEN_RE = re.compile(r"<references\b[^>]*(?<!/)>", re.IGNORECASE)
+_REFERENCES_CLOSE = "</references>"
+_HEADING_LINE_RE = re.compile(r"^=+[^=].*=+\s*$")
+
+
+def merge_split_references_blocks(text: str) -> tuple[str, int]:
+    """Rejoin a list-defined `<references>` block that chunking split in two.
+
+    A long "Citations" section is cut mid-block, so the first chunk's
+    translation closes the `<references>` it opened and the second chunk
+    (which has no opener) ends with the source's original `</references>`.
+    Assembled, that is `<references> defs </references> more defs
+    </references>`: the defs after the first closer sit outside the block,
+    so Cite reports every ref used only by them as "no text given" and every
+    ref defined inside as "not used in preceding text" — dozens of
+    orphaned_named_ref findings that no per-chunk repair can fix, since each
+    chunk looks fine alone.
+
+    A closer with no matching opener is the second half's; the previous
+    closer (same section, nothing but ref definitions between) is the
+    spurious one and is dropped. Returns (patched_text, merged_count)."""
+    lines = text.split("\n")
+    is_open = False
+    last_close: int | None = None
+    drop: set[int] = set()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if _HEADING_LINE_RE.match(stripped):
+            last_close = None
+        elif _REFERENCES_OPEN_RE.search(stripped):
+            is_open = True
+            last_close = None
+        elif stripped.lower() == _REFERENCES_CLOSE:
+            if is_open:
+                is_open = False
+                last_close = i
+            elif last_close is not None:
+                drop.add(last_close)
+                last_close = None
+    if not drop:
+        return text, 0
+    return "\n".join(line for i, line in enumerate(lines) if i not in drop), len(drop)
+
+
+_GROUP_ATTR_RE = re.compile(
+    r"(\bgroup\s*=\s*)(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'/>|}]+))", re.IGNORECASE
+)
+
+
+def _group_value(match: re.Match[str]) -> str:
+    return next(g for g in match.groups()[1:] if g is not None).strip()
+
+
+def restore_ref_group_names(text: str, source_text: str) -> tuple[str, dict[str, str]]:
+    """Undo translation of a footnote group's name (group=note ->
+    group="shënim").
+
+    The group name never reaches the reader, but it has to match exactly:
+    the model translates it in some chunks and keeps it in others, so the
+    notes of a translated `<ref group="shënim">` find no list (the
+    `{{Reflist|group=note|refs=...}}` that kept its name) and the model
+    adds a `<references group="shënim"/>` of its own wherever it pleases.
+
+    A translation-only group maps back when there's no doubt which source
+    group it was: the source has just one group, or exactly one source
+    group went missing in translation as exactly one new one appeared.
+    Returns (patched_text, {translated_name: source_name})."""
+    source_groups = {_group_value(m) for m in _GROUP_ATTR_RE.finditer(source_text)}
+    text_groups = {_group_value(m) for m in _GROUP_ATTR_RE.finditer(text)}
+    unknown = text_groups - source_groups
+    if not unknown:
+        return text, {}
+    if len(source_groups) == 1:
+        (target,) = source_groups
+        renamed = {name: target for name in unknown}
+    elif len(unknown) == 1 and len(source_groups - text_groups) == 1:
+        renamed = {next(iter(unknown)): next(iter(source_groups - text_groups))}
+    else:
+        return text, {}
+
+    def _rename(match: re.Match[str]) -> str:
+        name = _group_value(match)
+        if name not in renamed:
+            return match.group(0)
+        return f'{match.group(1)}"{renamed[name]}"'
+
+    return _GROUP_ATTR_RE.sub(_rename, text), renamed
+
+
+# A tag or template that renders a reference list and carries no
+# definitions of its own: `<references />`, an empty `<references></references>`,
+# or a one-line `{{Reflist}}`/`{{Notelist}}` without |refs=.
+_REF_LIST_RENDERER_RE = re.compile(
+    r"<references\b(?P<tag_attrs>[^>]*?)/>"
+    r"|<references\b(?P<pair_attrs>[^>]*)>\s*</references\s*>"
+    r"|\{\{\s*(?P<tpl>reflist|references|notelist|listë shënimesh)\s*(?P<tpl_args>\|[^{}\n]*)?\}\}",
+    re.IGNORECASE,
+)
+
+
+def _ref_list_key(match: re.Match[str]) -> tuple[str, str] | None:
+    """(kind, group) of a reference-list renderer, or None if it's a
+    template that defines refs (|refs=), which is content, not a stray."""
+    tpl = match.group("tpl")
+    attrs = match.group("tag_attrs") or match.group("pair_attrs") or match.group("tpl_args") or ""
+    if tpl and re.search(r"\|\s*refs\s*=", attrs, re.IGNORECASE):
+        return None
+    kind = "notelist" if tpl and tpl.lower() in ("notelist", "listë shënimesh") else "refs"
+    group = _GROUP_ATTR_RE.search(attrs)
+    return kind, _group_value(group) if group else ""
+
+
+def drop_stray_reference_lists(text: str, source_text: str) -> tuple[str, int]:
+    """Remove reference lists the model invented.
+
+    When chunking splits a long list-defined `<references>` block, the
+    model translating each later piece "completes" its fragment with a
+    `<references />` (or `<references group="..."/>`, or an empty
+    `<references></references>`) of its own — the Albert Einstein run had
+    nine where the source had one. Each one flushes the refs before it, so
+    the definitions after the first one land outside the real block and
+    Cite reports every ref used only by them as having no text. The same
+    habit drops `<references group="note" />` under random mid-article
+    headings.
+
+    For each (kind, group), keeps as many renderers as the source has
+    — the last ones, since reference lists close an article — and removes
+    the rest, whole line and all where the renderer stood alone.
+    Returns (patched_text, removed_count)."""
+    allowed: dict[tuple[str, str], int] = {}
+    for m in _REF_LIST_RENDERER_RE.finditer(source_text):
+        key = _ref_list_key(m)
+        if key is not None:
+            allowed[key] = allowed.get(key, 0) + 1
+
+    by_key: dict[tuple[str, str], list[re.Match[str]]] = {}
+    for m in _REF_LIST_RENDERER_RE.finditer(text):
+        key = _ref_list_key(m)
+        if key is not None:
+            by_key.setdefault(key, []).append(m)
+
+    spans: list[tuple[int, int]] = []
+    for key, matches in by_key.items():
+        excess = len(matches) - allowed.get(key, 0)
+        for m in matches[: max(excess, 0)]:
+            start, end = m.span()
+            line_start = text.rfind("\n", 0, start) + 1
+            line_end = text.find("\n", end)
+            line_end = len(text) if line_end == -1 else line_end
+            if not text[line_start:start].strip() and not text[end:line_end].strip():
+                start, end = line_start, min(line_end + 1, len(text))
+            spans.append((start, end))
+    if not spans:
+        return text, 0
+
+    parts: list[str] = []
+    pos = 0
+    for start, end in sorted(spans):
+        parts.append(text[pos:start])
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts), len(spans)
+
+
+_DEFS_AFTER_REFERENCES_RE = re.compile(
+    # HTML comments may sit between the definitions (the model leaves its
+    # own notes there); the run still has to end on a definition.
+    r"</references\s*>((?:(?:\s*<!--.*?-->)*\s*<ref\b[^>]*?(?<!/)>(?:(?!<ref\b).)*?</ref\s*>)+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extend_references_block_over_trailing_defs(text: str) -> tuple[str, int]:
+    """Move a `</references>` down past the ref definitions that directly
+    follow it.
+
+    The other half of merge_split_references_blocks: there the later
+    chunk kept the source's `</references>`; here the model dropped it (or
+    drop_stray_reference_lists removed the `<references />` it wrote
+    instead), so the block closes after the first chunk's definitions and
+    the rest trail after it, outside any list. A named definition right
+    after a reference list is never intended, so the run joins the block.
+    Returns (patched_text, moved_definition_count)."""
+    moved = 0
+
+    def _extend(match: re.Match[str]) -> str:
+        nonlocal moved
+        defs = match.group(1)
+        moved += len(re.findall(r"</ref\s*>", defs, re.IGNORECASE))
+        # lstrip: the newline after the old closer would otherwise leave a
+        # blank line where it stood.
+        return defs.lstrip() + "\n</references>"
+
+    return _DEFS_AFTER_REFERENCES_RE.sub(_extend, text), moved
+
+
+_REF_NAME_ATTR = r"\bname\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'/>]+))"
+_REF_SELF_CLOSING_RE = re.compile(r"<ref\b[^>]*?" + _REF_NAME_ATTR + r"[^>]*?/>", re.IGNORECASE)
+_REF_DEFINITION_RE = re.compile(
+    # The body may not run past another <ref opener: an unclosed definition
+    # (its </ref> lost in translation) would otherwise extend to the NEXT
+    # definition's </ref>, hiding that ref from `defined` — and
+    # restore_orphaned_ref_definitions would then add a duplicate
+    # definition of a ref that was there all along.
+    r"<ref\b[^>]*?" + _REF_NAME_ATTR + r"[^>]*?(?<!/)>((?:(?!<ref\b).)*?)</ref\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _ref_name(match: re.Match[str]) -> str:
+    return (match.group(1) or match.group(2) or match.group(3)).strip()
+
+
+def restore_orphaned_ref_definitions(text: str, source_text: str) -> tuple[str, list[str]]:
+    """Copy back named-ref definitions that translation dropped.
+
+    The model sometimes condenses away the sentence that carried a
+    `<ref name="x">...</ref>` definition while keeping a later
+    `<ref name="x" />` reuse — Cite then renders an orphaned-ref error.
+    Handing that to the LLM repair loop rarely works: the chunk that has
+    the reuse never saw the definition's content, so it either invents a
+    citation or does nothing, and the loop burns its rounds. The source
+    article still has the exact definition, so this rewrites the first
+    orphaned reuse into a full definition using the source's ref body
+    (citation bodies are kept untranslated anyway). Refs the source doesn't
+    define either are left for the repair loop.
+
+    Returns (patched_text, restored_names)."""
+    defined = {_ref_name(m) for m in _REF_DEFINITION_RE.finditer(text)}
+    source_defs: dict[str, str] = {}
+    for m in _REF_DEFINITION_RE.finditer(source_text):
+        source_defs.setdefault(_ref_name(m), m.group(4))
+
+    restored: list[str] = []
+
+    def _restore(match: re.Match[str]) -> str:
+        name = _ref_name(match)
+        if name in defined or name not in source_defs:
+            return match.group(0)
+        defined.add(name)
+        restored.append(name)
+        return f'<ref name="{name}">{source_defs[name]}</ref>'
+
+    return _REF_SELF_CLOSING_RE.sub(_restore, text), restored
+
+
+async def post_process_assembled(
+    text: str,
+    source_title: str,
+    source_text: str,
+    config: Config,
+    citation_client: httpx.AsyncClient | None,
+) -> tuple[str, dict[str, str] | None]:
+    """Deterministic string-level fixes for an assembled article. Run on
+    every fresh assembly — after each assembly-repair round and each
+    review-repair round alike — since assembling from chunks drops them.
+    Each fix is a no-op on already-fixed input, so repeating them is safe,
+    just not free.
+
+    Returns (patched_text, citation_languages_filled), the latter None when
+    the citation-language fill didn't run or failed."""
+    citation_languages_filled: dict[str, str] | None = None
+    if citation_client is not None:
+        try:
+            citation_result = await asyncio.wait_for(
+                fill_missing_citation_languages(
+                    text,
+                    citation_client,
+                    max_url_fetches=config.max_citation_url_fetches,
+                    concurrency=config.citation_fetch_concurrency,
+                    fetch_timeout=config.citation_fetch_timeout_s,
+                ),
+                timeout=config.citation_fill_timeout_s,
+            )
+            text = citation_result.patched_wikitext
+            citation_languages_filled = citation_result.filled
+            if citation_result.filled:
+                logger.info(
+                    "Filled |language= for %d/%d citation(s) in %r",
+                    len(citation_result.filled),
+                    citation_result.attempted,
+                    source_title,
+                )
+        except Exception as exc:
+            logger.warning("Citation language fill failed for %r: %s", source_title, exc)
+
+    if config.fix_citation_param_names:
+        try:
+            param_fix_result = fix_citation_param_names(text)
+            text = param_fix_result.patched_wikitext
+            if param_fix_result.renamed:
+                logger.info(
+                    "Renamed %d mistranslated citation parameter name(s) in %r: %s",
+                    len(param_fix_result.renamed),
+                    source_title,
+                    param_fix_result.renamed,
+                )
+        except Exception as exc:
+            logger.warning("Citation parameter name fix failed for %r: %s", source_title, exc)
+
+    try:
+        sfn_fix_result = fix_sfn_param_names(text)
+        text = sfn_fix_result.patched_wikitext
+        if sfn_fix_result.renamed:
+            logger.info(
+                "Renamed %d sfn parameter(s) in %r: %s",
+                len(sfn_fix_result.renamed),
+                source_title,
+                sfn_fix_result.renamed,
+            )
+    except Exception as exc:
+        logger.warning("Sfn parameter name fix failed for %r: %s", source_title, exc)
+
+    # Before the sfn fixers below: a note's {{sfn}} is fine inside
+    # {{refn}}, but convert_nested_sfn_to_harvnb would still see it as
+    # nested in a <ref> and turn it into a bare harvnb link.
+    try:
+        refn_result = convert_nested_ref_notes_to_refn(text)
+        text = refn_result.patched_wikitext
+        if refn_result.converted:
+            logger.info(
+                "Rewrote %d note(s) with a <ref> nested inside a <ref> as {{refn}} in %r: %s",
+                len(refn_result.converted),
+                source_title,
+                refn_result.converted,
+            )
+    except Exception as exc:
+        logger.warning("Nested-ref note conversion failed for %r: %s", source_title, exc)
+
+    try:
+        unwrap_result = unwrap_redundant_sfn_ref(text)
+        text = unwrap_result.patched_wikitext
+        if unwrap_result.unwrapped:
+            logger.info(
+                "Unwrapped %d redundant <ref>{{sfn}}</ref> wrapper(s) in %r: %s",
+                len(unwrap_result.unwrapped),
+                source_title,
+                unwrap_result.unwrapped,
+            )
+    except Exception as exc:
+        logger.warning("Redundant sfn-ref unwrap failed for %r: %s", source_title, exc)
+
+    try:
+        nested_result = convert_nested_sfn_to_harvnb(text)
+        text = nested_result.patched_wikitext
+        if nested_result.converted:
+            logger.info(
+                "Converted %d {{sfn}}/{{sfnp}} call(s) nested inside <ref> to harvnb/harvp in %r",
+                len(nested_result.converted),
+                source_title,
+            )
+    except Exception as exc:
+        logger.warning("Nested sfn-to-harvnb conversion failed for %r: %s", source_title, exc)
+
+    if config.dedupe_short_footnotes:
+        try:
+            dedupe_result = dedupe_short_footnotes(text)
+            text = dedupe_result.patched_wikitext
+            if dedupe_result.canonicalized:
+                logger.info(
+                    "Reconciled %d short-footnote identity group(s) with diverging |ps= in %r",
+                    len(dedupe_result.canonicalized),
+                    source_title,
+                )
+        except Exception as exc:
+            logger.warning("Short-footnote dedup failed for %r: %s", source_title, exc)
+
+    text = normalize_quote_templates(text)
+
+    # Group names first: drop_stray_reference_lists counts renderers
+    # per source group name.
+    text, renamed_groups = restore_ref_group_names(text, source_text)
+    if renamed_groups:
+        logger.info(
+            "Restored translated ref group name(s) in %r: %s", source_title, renamed_groups
+        )
+
+    text, dropped_lists = drop_stray_reference_lists(text, source_text)
+    if dropped_lists:
+        logger.info(
+            "Removed %d reference list(s) not in the source from %r", dropped_lists, source_title
+        )
+
+    text, merged_refs_blocks = merge_split_references_blocks(text)
+    if merged_refs_blocks:
+        logger.info(
+            "Merged %d <references> block(s) split across chunks in %r",
+            merged_refs_blocks,
+            source_title,
+        )
+
+    text, moved_defs = extend_references_block_over_trailing_defs(text)
+    if moved_defs:
+        logger.info(
+            "Moved %d ref definition(s) left after </references> back into the block in %r",
+            moved_defs,
+            source_title,
+        )
+
+    text, restored_refs = restore_orphaned_ref_definitions(text, source_text)
+    if restored_refs:
+        logger.info(
+            "Restored %d named-ref definition(s) dropped in translation of %r from the source: %s",
+            len(restored_refs),
+            source_title,
+            restored_refs,
+        )
+
+    return text, citation_languages_filled
+
+
 async def run_assembly_repair(
     chunks: list[Chunk],
     source: ArticleSource,
@@ -182,7 +598,7 @@ async def run_assembly_repair(
     cache: TranslationCache | None = None,
     facts: VerifiedFacts | None = None,
     qa_skill: SkillContent | None = None,
-) -> tuple[str, list[ValidationIssue], int, dict[str, str]]:
+) -> tuple[str, list[ValidationIssue], int, dict[str, str], list[str]]:
     """Post-processes and validates the assembled article, repairing only
     the chunks implicated by each round's findings, up to
     config.max_assembly_repair_rounds. Mutates chunk.translated_text in
@@ -194,98 +610,23 @@ async def run_assembly_repair(
     is in place.
 
     Returns (assembled_text, remaining_issues, rounds_used,
-    citation_languages_filled) — remaining_issues is empty iff the article
+    citation_languages_filled, removed_comments) — remaining_issues is empty iff the article
     is valid, whether immediately or after repair; the caller decides what
     "still has issues after the cap" means (needs_human_review)."""
     citation_languages_filled: dict[str, str] = {}
+    source_text = "\n".join(chunk.text for chunk in chunks)
 
     async def _post_process(text: str) -> str:
-        # Deterministic string-level fixes, re-run after every repair round
-        # (not just once) since a freshly reassembled `text` hasn't had
-        # them applied yet — each fix is written to be a no-op on
-        # already-fixed input, so repeating them is safe, just not free.
         nonlocal citation_languages_filled
-        if citation_client is not None:
-            try:
-                citation_result = await asyncio.wait_for(
-                    fill_missing_citation_languages(
-                        text,
-                        citation_client,
-                        max_url_fetches=config.max_citation_url_fetches,
-                        concurrency=config.citation_fetch_concurrency,
-                        fetch_timeout=config.citation_fetch_timeout_s,
-                    ),
-                    timeout=config.citation_fill_timeout_s,
-                )
-                text = citation_result.patched_wikitext
-                citation_languages_filled = citation_result.filled
-                if citation_result.filled:
-                    logger.info(
-                        "Filled |language= for %d/%d citation(s) in %r",
-                        len(citation_result.filled),
-                        citation_result.attempted,
-                        source.title,
-                    )
-            except Exception as exc:
-                logger.warning("Citation language fill failed for %r: %s", source.title, exc)
-
-        if config.fix_citation_param_names:
-            try:
-                param_fix_result = fix_citation_param_names(text)
-                text = param_fix_result.patched_wikitext
-                if param_fix_result.renamed:
-                    logger.info(
-                        "Renamed %d mistranslated citation parameter name(s) in %r: %s",
-                        len(param_fix_result.renamed),
-                        source.title,
-                        param_fix_result.renamed,
-                    )
-            except Exception as exc:
-                logger.warning("Citation parameter name fix failed for %r: %s", source.title, exc)
-
-        try:
-            sfn_fix_result = fix_sfn_param_names(text)
-            text = sfn_fix_result.patched_wikitext
-            if sfn_fix_result.renamed:
-                logger.info(
-                    "Renamed %d sfn parameter(s) in %r: %s",
-                    len(sfn_fix_result.renamed),
-                    source.title,
-                    sfn_fix_result.renamed,
-                )
-        except Exception as exc:
-            logger.warning("Sfn parameter name fix failed for %r: %s", source.title, exc)
-
-        try:
-            unwrap_result = unwrap_redundant_sfn_ref(text)
-            text = unwrap_result.patched_wikitext
-            if unwrap_result.unwrapped:
-                logger.info(
-                    "Unwrapped %d redundant <ref>{{sfn}}</ref> wrapper(s) in %r: %s",
-                    len(unwrap_result.unwrapped),
-                    source.title,
-                    unwrap_result.unwrapped,
-                )
-        except Exception as exc:
-            logger.warning("Redundant sfn-ref unwrap failed for %r: %s", source.title, exc)
-
-        if config.dedupe_short_footnotes:
-            try:
-                dedupe_result = dedupe_short_footnotes(text)
-                text = dedupe_result.patched_wikitext
-                if dedupe_result.canonicalized:
-                    logger.info(
-                        "Reconciled %d short-footnote identity group(s) with diverging |ps= in %r",
-                        len(dedupe_result.canonicalized),
-                        source.title,
-                    )
-            except Exception as exc:
-                logger.warning("Short-footnote dedup failed for %r: %s", source.title, exc)
-
-        text = normalize_quote_templates(text)
-
+        text, filled = await post_process_assembled(text, source.title, source_text, config, citation_client)
+        if filled is not None:
+            citation_languages_filled = filled
         return text
 
+    # Per chunk, before assembly: matching a comment to the source needs
+    # the chunk's own source text. Re-run after every repair round, since a
+    # repair call is where the model most often leaves a note of its own.
+    removed_comments = reconcile_chunk_comments(chunks)
     assembled = await _post_process(assemble_chunks(chunks))
     combined_issues = await _validate_assembled(
         assembled, target_mw_client, source.title, config.live_validate, config.live_validate_timeout_s
@@ -328,6 +669,7 @@ async def run_assembly_repair(
         # no extractable ref name keep the old all-chunk broadcast.
         targeted_unlocalized: dict[int, list[str]] = {}
         broadcast_unlocalized: list[str] = []
+        targeted_counts: dict[tuple[str, int], int] = {}
         for issue, text_line in unlocalized:
             ref_names = _ref_names_in_message(issue)
             target = next(
@@ -339,66 +681,81 @@ async def run_assembly_repair(
                 None,
             )
             if target is not None:
-                logger.info(
-                    "Targeted unlocalized %r finding to chunk %d (mentions the named ref) instead of "
-                    "broadcasting to all %d chunk(s)",
-                    issue.kind, target.order, len(chunks),
-                )
-                targeted_unlocalized.setdefault(id(target), []).append(text_line)
-            else:
+                lines_for_target = targeted_unlocalized.setdefault(id(target), [])
+                if text_line not in lines_for_target:
+                    lines_for_target.append(text_line)
+                count_key = (issue.kind, target.order)
+                targeted_counts[count_key] = targeted_counts.get(count_key, 0) + 1
+            elif text_line not in broadcast_unlocalized:
                 broadcast_unlocalized.append(text_line)
+        for (kind, order), count in sorted(targeted_counts.items(), key=lambda kv: kv[0][1]):
+            logger.info(
+                "Targeted %d unlocalized %r finding(s) to chunk %d (mentions the named ref) instead of "
+                "broadcasting to all %d chunk(s)",
+                count, kind, order, len(chunks),
+            )
 
-        for chunk in chunks:
-            errors_for_chunk = (
+        # Each chunk's repair only reads and writes that chunk, so a
+        # round's repairs run in parallel (bounded by
+        # assembly_repair_concurrency) instead of one after another.
+        semaphore = asyncio.Semaphore(max(1, config.assembly_repair_concurrency))
+
+        async def _repair(chunk: Chunk, errors_for_chunk: list[str]) -> None:
+            async with semaphore:
+                try:
+                    stats.repair_attempts += 1
+                    repair_result = await repair_chunk(
+                        llm_client,
+                        skill,
+                        config.model,
+                        config.temperature,
+                        chunk.source_lang,
+                        config.target_lang,
+                        chunk.article_title,
+                        chunk.section_title,
+                        chunk.translated_text or "",
+                        errors_for_chunk,
+                        pricing,
+                        on_retry=on_retry,
+                        qa_skill=qa_skill,
+                    )
+                    stats.record_usage(config.model, repair_result)
+                    chunk.translated_text = repair_result.text
+                    if cache is not None:
+                        # Without this, a fix made here is invisible to future
+                        # reruns' cache lookups: translate_chunk's own cache.set
+                        # already ran (pre-repair) when this chunk was first
+                        # translated, so re-caching now with the same key
+                        # overwrites that stale entry with the repaired text.
+                        facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
+                        facts_hash = hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
+                        key = compute_key(
+                            config.model, chunk.source_lang, config.target_lang, chunk.text, skill.content_hash, facts_hash
+                        )
+                        cache.set(key, config.model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text)
+                except Exception as exc:
+                    logger.warning(
+                        "Assembly-level repair failed for %r chunk %d (round %d): %s",
+                        source.title, chunk.order, rounds_used, exc,
+                    )
+
+        await asyncio.gather(*(
+            _repair(chunk, errors_for_chunk)
+            for chunk in chunks
+            if (errors_for_chunk := (
                 localized.get(id(chunk), [])
                 + targeted_unlocalized.get(id(chunk), [])
                 + broadcast_unlocalized
-            )
-            if not errors_for_chunk:
-                continue
-            try:
-                stats.repair_attempts += 1
-                repair_result = await repair_chunk(
-                    llm_client,
-                    skill,
-                    config.model,
-                    config.temperature,
-                    chunk.source_lang,
-                    config.target_lang,
-                    chunk.article_title,
-                    chunk.section_title,
-                    chunk.translated_text or "",
-                    errors_for_chunk,
-                    pricing,
-                    on_retry=on_retry,
-                    qa_skill=qa_skill,
-                )
-                stats.record_usage(config.model, repair_result)
-                chunk.translated_text = repair_result.text
-                if cache is not None:
-                    # Without this, a fix made here is invisible to future
-                    # reruns' cache lookups: translate_chunk's own cache.set
-                    # already ran (pre-repair) when this chunk was first
-                    # translated, so re-caching now with the same key
-                    # overwrites that stale entry with the repaired text.
-                    facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
-                    facts_hash = hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
-                    key = compute_key(
-                        config.model, chunk.source_lang, config.target_lang, chunk.text, skill.content_hash, facts_hash
-                    )
-                    cache.set(key, config.model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text)
-            except Exception as exc:
-                logger.warning(
-                    "Assembly-level repair failed for %r chunk %d (round %d): %s",
-                    source.title, chunk.order, rounds_used, exc,
-                )
+            ))
+        ))
 
+        removed_comments.extend(reconcile_chunk_comments(chunks))
         assembled = await _post_process(assemble_chunks(chunks))
         combined_issues = await _validate_assembled(
             assembled, target_mw_client, source.title, config.live_validate, config.live_validate_timeout_s
         )
 
-    return assembled, combined_issues, rounds_used, citation_languages_filled
+    return assembled, combined_issues, rounds_used, citation_languages_filled, removed_comments
 
 
 def _localize_review_issues(
@@ -450,7 +807,8 @@ async def run_review_pass(
     on_retry: RetryCallback | None = None,
     cache: TranslationCache | None = None,
     qa_skill: SkillContent | None = None,
-) -> tuple[str, list[ValidationIssue], int]:
+    citation_client: httpx.AsyncClient | None = None,
+) -> tuple[str, list[ValidationIssue], int, list[str]]:
     """Independent semantic-fidelity review of an already assembled,
     structurally valid article (see review.py) — the whole-article
     counterpart to translate_chunk's per-chunk generate/validate loop, run
@@ -466,8 +824,13 @@ async def run_review_pass(
     run_assembly_repair does for deterministic findings. Capped at
     config.review_max_repair_attempts.
 
-    Returns (assembled_text, remaining_issues, rounds_used) — remaining_issues
-    is empty iff the review pass converged (no findings, or every finding
+    After a repair round the article is reassembled from the chunks, so
+    the comment reconciliation and post_process_assembled fixes that
+    run_assembly_repair applied are applied again — otherwise the saved
+    article would lose them.
+
+    Returns (assembled_text, remaining_issues, rounds_used,
+    removed_comments) — remaining_issues is empty iff the review pass converged (no findings, or every finding
     got resolved within the round cap); a non-empty result does NOT mean
     the caller should withhold the article (see review_queue.record_review_flags)."""
 
@@ -488,6 +851,8 @@ async def run_review_pass(
         stats.review_findings_total += len(findings)
         return findings
 
+    source_text = "\n".join(chunk.text for chunk in chunks)
+    removed_comments: list[str] = []
     assembled = initial_assembled
     review_findings = await _run_review_call(assembled)
     structural_issues = await _validate_assembled(
@@ -542,14 +907,17 @@ async def run_review_pass(
                     source.title, chunk.order, rounds_used, exc,
                 )
 
-        assembled = assemble_chunks(chunks)
+        removed_comments.extend(reconcile_chunk_comments(chunks))
+        assembled, _ = await post_process_assembled(
+            assemble_chunks(chunks), source.title, source_text, config, citation_client
+        )
         structural_issues = await _validate_assembled(
             assembled, target_mw_client, source.title, config.live_validate, config.live_validate_timeout_s
         )
         review_findings = await _run_review_call(assembled)
         combined = structural_issues + review_findings
 
-    return assembled, combined, rounds_used
+    return assembled, combined, rounds_used, removed_comments
 
 
 async def _plan_article(
@@ -568,6 +936,24 @@ async def _plan_article(
         except Exception as exc:
             logger.error("Failed to fetch %r (lang=%s): %s", item.title, effective_lang, exc)
             return None
+
+        # Before verification/chunking: a {{Cref2}} marker and its {{Cnote2}}
+        # text live in different chunks, so they must be joined on the whole
+        # source (see notes.py). Replaces `source` so the reviewer compares
+        # the translation against the same text that was translated.
+        try:
+            note_result = expand_cref_notes(source.wikitext)
+            if note_result.expanded:
+                source = source.model_copy(update={"wikitext": note_result.patched_wikitext})
+                logger.info(
+                    "Expanded %d {{Cref2}} note marker(s) into <ref group> footnotes in %r%s%s",
+                    note_result.expanded,
+                    source.title,
+                    f"; left {note_result.unresolved} unresolved" if note_result.unresolved else "",
+                    f"; dropped unreferenced note(s) {note_result.unreferenced}" if note_result.unreferenced else "",
+                )
+        except Exception as exc:
+            logger.warning("Cref2 note expansion failed for %r: %s", item.title, exc)
 
         facts = VerifiedFacts()
         if wikidata_client is not None:
@@ -611,9 +997,23 @@ async def run_pipeline(
     force: bool = False,
     reporter: ProgressReporter | None = None,
     stats_tracker: StatsTracker | None = None,
+    resume_unfinished: bool = True,
 ) -> StatsTracker:
     stats_tracker = stats_tracker if stats_tracker is not None else StatsTracker()
     stats = stats_tracker.stats
+
+    if resume_unfinished:
+        unfinished = unfinished_inputs(config, inputs)
+        if unfinished:
+            logger.info("Retrying %d unfinished article(s) before starting new work", len(unfinished))
+            await run_pipeline(
+                config.model_copy(update={"sequential": True}), unfinished,
+                reporter=reporter, stats_tracker=stats_tracker, resume_unfinished=False,
+            )
+            attempted = {input_key(item, config) for item in unfinished}
+            inputs = [item for item in inputs if input_key(item, config) not in attempted]
+        if not inputs:
+            return stats_tracker
 
     skill = load_skill(config.skill_path, config.include_skill_references, config.skill_git_ref)
     qa_skill = (
@@ -733,12 +1133,20 @@ async def run_pipeline(
                     # limit (see claude_code_client.ClaudeCodeSessionLimitError).
                     "opencode_go" if config.provider == "claude_code" else "claude_code"
                 )
-                if not target or target == config.provider:
+                target_model = config.fallback_model or default_model_for_provider(target)
+                if not target or (target == config.provider and (
+                    not config.fallback_model or target_model == config.model
+                )):
+                    return False
+
+                if target == "openrouter" and not config.openrouter_api_key:
+                    logger.error("Cannot switch to OpenRouter: set OPENROUTER_API_KEY or openrouter_api_key.")
+                    fallback_declined = True
                     return False
 
                 interactive = reporter is not None and reporter.is_live
                 proceed = True
-                if interactive:
+                if interactive and not config.fallback_auto_switch:
                     reporter.pause()
                     try:
                         # markup=False: the prompt's own `[provider]`/`[Y/n]`
@@ -749,7 +1157,7 @@ async def run_pipeline(
                         answer = await asyncio.to_thread(
                             reporter.console.input,
                             f"\n{config.provider} ran out of credits. Switch to "
-                            f"'{target}' and continue this run? [Y/n] ",
+                            f"'{target}' ({target_model}) and continue this run? [Y/n] ",
                             markup=False,
                         )
                     finally:
@@ -761,7 +1169,7 @@ async def run_pipeline(
                     # so switch automatically and just log it.
                     logger.warning(
                         "Provider %r ran out of credits; auto-switching to fallback "
-                        "provider %r for the rest of this run (non-interactive).",
+                        "provider %r for the rest of this run.",
                         config.provider, target,
                     )
 
@@ -770,7 +1178,7 @@ async def run_pipeline(
                     return False
 
                 new_config = config.model_copy(
-                    update={"provider": target, "model": default_model_for_provider(target)}
+                    update={"provider": target, "model": target_model}
                 )
                 new_client, effective_model = build_llm_client(new_config)
                 if effective_model != new_config.model:
@@ -796,6 +1204,15 @@ async def run_pipeline(
                 return True
 
         async def process_article(source: ArticleSource, chunks: list[Chunk], facts: VerifiedFacts) -> None:
+            original = next(
+                (item for item, plan in zip(pending_items, planned)
+                 if plan is not None and plan[0] is source),
+                ArticleInput(title=source.title, source_lang=source.source_lang),
+            )
+            checkpoint_input(config, ArticleInput(
+                title=source.title, local_path=original.local_path,
+                source_lang=source.source_lang,
+            ))
             article_stats = {
                 'input_tokens': 0,
                 'output_tokens': 0,
@@ -928,7 +1345,7 @@ async def run_pipeline(
 
             # All chunks succeeded, proceed with assembly and post-processing
             target_mw_client = mw_pool.get(config.target_lang)
-            assembled, combined_issues, rounds_used, citation_languages_filled = await run_assembly_repair(
+            assembled, combined_issues, rounds_used, citation_languages_filled, removed_comments = await run_assembly_repair(
                 chunks, source, config, llm_client, skill, pricing, target_mw_client, citation_client, stats, on_retry,
                 cache, facts, qa_skill,
             )
@@ -949,10 +1366,12 @@ async def run_pipeline(
 
             review_findings: list[ValidationIssue] = []
             if review_model is not None:
-                assembled, review_findings, review_rounds = await run_review_pass(
+                assembled, review_findings, review_rounds, review_removed_comments = await run_review_pass(
                     chunks, source, config, assembled, review_client, review_model, skill,
                     review_pricing, target_mw_client, stats, facts, on_retry, cache, qa_skill,
+                    citation_client,
                 )
+                removed_comments.extend(review_removed_comments)
                 if review_findings:
                     stats.articles_flagged_by_review += 1
                     flags_path = record_review_flags(config.output_dir, source.title, review_findings, review_rounds)
@@ -983,6 +1402,7 @@ async def run_pipeline(
                         chunks=chunks,
                         facts=facts,
                         citation_languages_filled=citation_languages_filled,
+                        removed_comments=removed_comments,
                         review_model=review_model,
                         review_findings=review_findings,
                     ),

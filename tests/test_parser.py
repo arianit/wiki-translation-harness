@@ -105,3 +105,21 @@ def test_oversized_section_heading_merged_into_following_table_not_standalone():
     assert "".join(result) == text
     assert not any(estimate_tokens(c) <= 5 for c in result)
     assert result[0].startswith("== 21st century ==\n")
+
+
+def test_chunk_never_splits_ref_inside_references_block():
+    # Regression (Albert Einstein): list-defined refs inside a large
+    # <references> block were split as free text, so the sentence splitter
+    # cut `... p. 23.</ref>` after "p." and the model dropped the orphaned
+    # `</ref>` that opened the next chunk.
+    defs = "".join(
+        f'<ref name="r{i}">van Dongen, Jeroen (2010) Einstein\'s Unification. CUP, p. {i}.</ref>\n'
+        for i in range(60)
+    )
+    text = f"== Citations ==\n<references>\n{defs}</references>\n"
+    sections = split_into_sections(text)
+    chunks = build_chunks("Test", sections, chunk_min=10, chunk_max=50)
+    assert len(chunks) > 1
+    assert "".join(c.text for c in chunks) == text
+    for c in chunks:
+        assert c.text.count("<ref ") == c.text.count("</ref>")

@@ -107,3 +107,4 @@ def save_partial_article(partial_output_dir: Path, title: str, chunks: list[Chun
 
 def discard_partial_article(partial_output_dir: Path, title: str) -> None:
     output_path_for(partial_output_dir, title).unlink(missing_ok=True)
+    output_path_for(partial_output_dir, title).with_suffix('.resume.json').unlink(missing_ok=True)

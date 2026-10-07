@@ -47,6 +47,11 @@ def build_llm_client(config: Config) -> tuple[LLMEngineClient, str]:
     config.model_copy(update={"model": effective_model}) if it differs, the
     same way both call sites did before this function replaced their inline
     resolve_llm_endpoint(...) -> OpenRouterClient(...) construction."""
+    if config.provider == "codex":
+        from wiki_translation_harness.codex_client import CodexClient
+
+        return CodexClient(config.codex_cli_path, config.request_timeout_s, config.max_retries), config.model
+
     if config.provider == "claude_code":
         # Local import: keeps claude_code_client.py's subprocess/tempfile
         # imports out of the path for anyone only ever using openrouter/local.

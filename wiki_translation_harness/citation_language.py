@@ -468,6 +468,158 @@ def unwrap_redundant_sfn_ref(wikitext: str) -> RefUnwrapResult:
     return RefUnwrapResult(patched_wikitext=str(code), unwrapped=unwrapped)
 
 
+# sfn/sfnp's non-self-wrapping twins (same positional/page parameters).
+_SFN_TO_HARV = {"sfn": "harvnb", "sfnp": "harvp"}
+
+
+@dataclass
+class NestedSfnResult:
+    patched_wikitext: str
+    converted: list[str]  # each sfn/sfnp call renamed to its harv* twin
+
+
+def convert_nested_sfn_to_harvnb(wikitext: str) -> NestedSfnResult:
+    """Renames {{sfn}}/{{sfnp}} to {{harvnb}}/{{harvp}} wherever they sit
+    inside an explicit <ref>...</ref>.
+
+    unwrap_redundant_sfn_ref only handles a bare <ref> around ONE sfn call.
+    The other shape — a <ref> bundling several citations, e.g.
+    <ref>{{Sfn|A|1980|p=1}}, {{Sfn|B|2001|p=2}}</ref> — is what the skill's
+    "bundled {{harvnb}} inside one <ref> -> consecutive {{Sfn}} calls" row
+    produces when the model swaps the template but keeps the wrapper. The
+    English source had {{harvnb}} there, which is correct (it renders a
+    bare link and is meant to live inside a <ref>); {{sfn}} self-wraps, so
+    the swap nests refs and Cite flags every FOOTNOTE... name as "defined
+    in <references> but not used" (confirmed live, Alexander the Great,
+    2026-10-04: 15 such errors from 5 bundled refs). Restoring harvnb keeps
+    the one-footnote-many-sources shape the source had, instead of
+    exploding it into several footnotes. Run after unwrap_redundant_sfn_ref
+    so a lone bare wrapper is still unwrapped to a plain {{sfn}}."""
+    code = mwp.parse(wikitext)
+    converted: list[str] = []
+    for tag in code.filter_tags(recursive=True):
+        if str(tag.tag).strip().lower() != "ref" or tag.contents is None:
+            continue
+        for tmpl in tag.contents.filter_templates(recursive=True):
+            bare = str(tmpl.name).strip()
+            target = _SFN_TO_HARV.get(bare.lower())
+            if target is None:
+                continue
+            converted.append(str(tmpl).strip())
+            # Keep the original name's surrounding whitespace ("{{Sfn |...").
+            tmpl.name = str(tmpl.name).replace(bare, target)
+    return NestedSfnResult(patched_wikitext=str(code), converted=converted)
+
+
+_REF_TOKEN_RE = re.compile(r"<ref\b[^>]*?/\s*>|<ref\b[^>]*>|</ref\s*>", re.IGNORECASE)
+_REF_ATTR_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'/>]+))")
+
+
+@dataclass
+class NestedRefNoteResult:
+    patched_wikitext: str
+    converted: list[str]  # opening tag of each note rewritten as {{refn}}
+
+
+def _escape_top_level_pipes(text: str) -> str:
+    """Escapes `|` outside {{...}}, [[...]] and <ref>...</ref> as {{!}} so
+    the text survives as a single template argument. Pipes inside <ref>
+    content are safe: the preprocessor strips extension tags before it
+    splits template arguments."""
+    out: list[str] = []
+    braces = brackets = ref_depth = 0
+    i = 0
+    while i < len(text):
+        token = _REF_TOKEN_RE.match(text, i)
+        if token:
+            tag = token.group(0)
+            if tag.startswith("</"):
+                ref_depth = max(0, ref_depth - 1)
+            elif not tag.rstrip(">").rstrip().endswith("/"):
+                ref_depth += 1
+            out.append(tag)
+            i = token.end()
+            continue
+        pair = text[i : i + 2]
+        if pair in ("{{", "}}", "[[", "]]"):
+            if pair == "{{":
+                braces += 1
+            elif pair == "}}":
+                braces = max(0, braces - 1)
+            elif pair == "[[":
+                brackets += 1
+            else:
+                brackets = max(0, brackets - 1)
+            out.append(pair)
+            i += 2
+            continue
+        ch = text[i]
+        out.append("{{!}}" if ch == "|" and not (braces or brackets or ref_depth) else ch)
+        i += 1
+    return "".join(out)
+
+
+def convert_nested_ref_notes_to_refn(wikitext: str) -> NestedRefNoteResult:
+    """Rewrites a <ref> whose content contains another <ref> as {{refn}}.
+
+    English Wikipedia writes explanatory notes that cite their own sources
+    as {{refn|group=note|Text.<ref>{{cite ...}}</ref>}} — {{refn}} expands
+    through {{#tag:ref}}, which is what lets a ref sit inside a note. The
+    model sometimes "simplifies" that to <ref group="note">Text.<ref>...
+    </ref></ref>, which Cite cannot parse: the inner </ref> closes the
+    outer note early and the leftover </ref> renders as text (confirmed in
+    Albert Einstein and Vietnam War partial drafts, 2026-10-06). Restoring
+    {{refn}} keeps the group, name and the note's sources exactly as
+    translated. sq.wikipedia's Stampa:Refn takes |name=, |group= and |1=.
+
+    Works line by line: notes are single-paragraph, and a ref definition
+    cut by chunking (opener on one line, no closer) must never be mistaken
+    for a note wrapping everything up to some later stray </ref>. Nesting
+    deeper than one level is left alone."""
+    converted: list[str] = []
+    lines = wikitext.split("\n")
+    for line_no, line in enumerate(lines):
+        if line.lower().count("<ref") < 2:
+            continue
+        pieces: list[str] = []
+        pos = 0
+        depth = max_depth = 0
+        outer: re.Match[str] | None = None
+        for token in _REF_TOKEN_RE.finditer(line):
+            tag = token.group(0)
+            if tag.startswith("</"):
+                if depth == 0:
+                    continue  # stray closer; leave it alone
+                depth -= 1
+                if depth == 0 and outer is not None:
+                    if max_depth == 2:
+                        attrs = {
+                            m.group(1).lower(): m.group(2) or m.group(3) or m.group(4) or ""
+                            for m in _REF_ATTR_RE.finditer(outer.group(0)[4:])
+                        }
+                        params = "".join(
+                            f"|{key}={attrs[key]}" for key in ("group", "name") if attrs.get(key)
+                        )
+                        content = _escape_top_level_pipes(line[outer.end() : token.start()].strip())
+                        pieces.append(line[pos : outer.start()])
+                        pieces.append(f"{{{{refn{params}|1={content}}}}}")
+                        pos = token.end()
+                        converted.append(outer.group(0))
+                    outer = None
+            elif tag.rstrip(">").rstrip().endswith("/"):
+                if depth >= 1:
+                    max_depth = max(max_depth, depth + 1)
+            else:
+                if depth == 0:
+                    outer, max_depth = token, 1
+                depth += 1
+                max_depth = max(max_depth, depth)
+        if pos:
+            pieces.append(line[pos:])
+            lines[line_no] = "".join(pieces)
+    return NestedRefNoteResult(patched_wikitext="\n".join(lines), converted=converted)
+
+
 @dataclass
 class FootnoteDedupeResult:
     patched_wikitext: str

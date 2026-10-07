@@ -21,7 +21,7 @@ def test_missing_api_key_raises(tmp_path: Path, monkeypatch):
 def test_default_provider_and_workers():
     cfg = build_config(None, _CONTACT)
     assert cfg.provider == "claude_code"
-    assert cfg.model == "claude-sonnet-5"
+    assert cfg.model == "claude-sonnet-5-5"
     assert cfg.workers == 2
 
 
@@ -57,7 +57,7 @@ def test_cli_provider_switch_drops_stale_yaml_model(tmp_path: Path, monkeypatch)
     config_file.write_text("provider: openrouter\nmodel: deepseek/deepseek-chat-v3-0324\n")
     cfg = build_config(config_file, {**_CONTACT, "provider": "claude_code"})
     assert cfg.provider == "claude_code"
-    assert cfg.model == "claude-sonnet-5"
+    assert cfg.model == "claude-sonnet-5-5"
 
 
 def test_cli_overrides_win_over_yaml(tmp_path: Path, monkeypatch):

@@ -12,6 +12,7 @@ orchestration (round counting, chunk-targeted repair, the cap, and
 independence from the per-chunk loop), not re-testing either validator.
 """
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,11 @@ import pytest
 from wiki_translation_harness.cache import TranslationCache, compute_key
 from wiki_translation_harness.models import Chunk, Config, RunStats
 from wiki_translation_harness.pipeline import (
+    drop_stray_reference_lists,
+    extend_references_block_over_trailing_defs,
+    merge_split_references_blocks,
+    restore_orphaned_ref_definitions,
+    restore_ref_group_names,
     run_assembly_repair,
     run_review_pass,
 )
@@ -96,7 +102,7 @@ async def test_no_issues_needs_no_repair():
     client = FakeOpenRouterClient([])  # would raise IndexError if a repair call happened
     stats = RunStats()
 
-    assembled, issues, rounds, _ = await run_assembly_repair(
+    assembled, issues, rounds, _, _ = await run_assembly_repair(
         [chunk], _FakeSource(), _config(), client, _skill(), None,
         FakeMediaWikiClient(raise_if_called=True), None, stats,
     )
@@ -113,7 +119,7 @@ async def test_resolves_within_cap():
     client = FakeOpenRouterClient(["Bibliografia.\n{{Cite book|last=Smith}}\n"])
     stats = RunStats()
 
-    assembled, issues, rounds, _ = await run_assembly_repair(
+    assembled, issues, rounds, _, _ = await run_assembly_repair(
         [chunk], _FakeSource(), _config(max_assembly_repair_rounds=3), client, _skill(), None,
         FakeMediaWikiClient(raise_if_called=True), None, stats,
     )
@@ -133,7 +139,7 @@ async def test_exhausts_cap_returns_remaining_issues():
     client = FakeOpenRouterClient(["{{harvc|last=Smith}} v2", "{{harvc|last=Smith}} v3"])
     stats = RunStats()
 
-    assembled, issues, rounds, _ = await run_assembly_repair(
+    assembled, issues, rounds, _, _ = await run_assembly_repair(
         [chunk], _FakeSource(), _config(max_assembly_repair_rounds=2), client, _skill(), None,
         FakeMediaWikiClient(raise_if_called=True), None, stats,
     )
@@ -174,7 +180,7 @@ async def test_live_validate_enabled_issue_repairs_via_live_check():
     client = FakeOpenRouterClient(["Fixed: {{Sfn|Smith|2020}}"])
     stats = RunStats()
 
-    assembled, issues, rounds, _ = await run_assembly_repair(
+    assembled, issues, rounds, _, _ = await run_assembly_repair(
         [chunk], _FakeSource(), _config(live_validate=True, max_assembly_repair_rounds=2),
         client, _skill(), None, mw_client, None, stats,
     )
@@ -235,7 +241,7 @@ async def test_unlocalized_ref_issue_only_reaches_chunk_mentioning_that_ref():
     client = FakeOpenRouterClient(["Chunk with ref fixed."])
     stats = RunStats()
 
-    assembled, issues, rounds, _ = await run_assembly_repair(
+    assembled, issues, rounds, _, _ = await run_assembly_repair(
         [clean, with_ref], _FakeSource(), _config(live_validate=True, max_assembly_repair_rounds=2),
         client, _skill(), None, mw_client, None, stats,
     )
@@ -296,7 +302,7 @@ async def test_review_pass_finds_and_fixes_issue():
     )
     stats = RunStats()
 
-    assembled, issues, rounds = await run_review_pass(
+    assembled, issues, rounds, _ = await run_review_pass(
         [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Parisi eshte nje qytet i madh.",
         client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), stats, VerifiedFacts(),
     )
@@ -313,6 +319,32 @@ async def test_review_pass_finds_and_fixes_issue():
     # repair both get attributed to the same per-model breakdown entry.
     assert stats.model_usage["review-model"].calls == 3
     assert stats.model_usage["review-model"].tokens_in == 300
+
+
+@pytest.mark.asyncio
+async def test_review_pass_reapplies_post_processing_after_repair():
+    # Regression: the review pass used to reassemble with plain
+    # assemble_chunks(), so a review repair silently undid every
+    # post-processing fix in the saved article.
+    chunk = _chunk("Parisi eshte nje qytet.{{sfn|Smith|2020|f=5}}")
+    chunk.text = "Paris is a city.{{sfn|Smith|2020|p=5}}"
+    client = FakeOpenRouterClient(
+        [
+            '[{"kind": "grammar_case", "message": "Wrong case.", "snippet": "Parisi eshte"}]',
+            # The repair keeps the mistranslated |f= and adds a note of its own.
+            "Parisi është një qytet.{{sfn|Smith|2020|f=5}}<!-- rregullova rasën -->",
+            "[]",
+        ]
+    )
+
+    assembled, issues, _, removed_comments = await run_review_pass(
+        [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Parisi eshte nje qytet.{{sfn|Smith|2020|p=5}}",
+        client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), RunStats(), VerifiedFacts(),
+    )
+
+    assert issues == []
+    assert assembled == "Parisi është një qytet.{{sfn|Smith|2020|p=5}}"
+    assert removed_comments == ["rregullova rasën"]
 
 
 @pytest.mark.asyncio
@@ -348,7 +380,7 @@ async def test_review_pass_structural_safety_net_catches_review_driven_regressio
     client = FakeOpenRouterClient(["[]", "{{Cite book|last=Smith}}", "[]"])
     stats = RunStats()
 
-    assembled, issues, rounds = await run_review_pass(
+    assembled, issues, rounds, _ = await run_review_pass(
         [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "{{harvc|last=Smith}}",
         client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), stats, VerifiedFacts(),
     )
@@ -379,3 +411,155 @@ async def test_review_pass_uses_review_model_not_config_model():
     )
 
     assert calls_with_model == ["review-model-xyz"]
+
+
+def test_merge_split_references_blocks_drops_spurious_first_closer():
+    text = (
+        "=== Citime ===\n<references>\n<ref name=\"A\">a</ref>\n</references>\n"
+        "<ref name=\"B\">b</ref>\n</references>\n=== Bibliografia ===\n"
+    )
+    patched, merged = merge_split_references_blocks(text)
+    assert merged == 1
+    assert patched == (
+        "=== Citime ===\n<references>\n<ref name=\"A\">a</ref>\n"
+        "<ref name=\"B\">b</ref>\n</references>\n=== Bibliografia ===\n"
+    )
+
+
+def test_merge_split_references_blocks_leaves_well_formed_blocks_alone():
+    text = (
+        "== Shënime ==\n<references group=\"sh\">\n<ref name=\"A\">a</ref>\n</references>\n"
+        "=== Citime ===\n<references>\n<ref name=\"B\">b</ref>\n</references>\n"
+        "{{Reflist}}\n<references />\n"
+    )
+    assert merge_split_references_blocks(text) == (text, 0)
+
+
+def test_merge_split_references_blocks_does_not_cross_headings():
+    # A stray closer in a later section is not the other half of the earlier block.
+    text = "<references>\n</references>\n== Next ==\n</references>\n"
+    assert merge_split_references_blocks(text) == (text, 0)
+
+
+def test_restore_ref_group_names_maps_translated_group_back_to_source():
+    # Regression (Albert Einstein): group=note became group="shënim" in some
+    # chunks but not in {{Reflist|group=note|refs=...}}.
+    source = 'x<ref group=note name=A/>\n{{reflist|group=note|refs=\n<ref name=A>a</ref>\n}}\n'
+    text = 'x<ref group="shënim" name=A/>\n{{Reflist|group=note|refs=\n<ref name=A>a</ref>\n}}\n'
+    patched, renamed = restore_ref_group_names(text, source)
+    assert renamed == {"shënim": "note"}
+    assert patched == source.replace("group=note name", 'group="note" name').replace("reflist", "Reflist")
+
+
+def test_restore_ref_group_names_leaves_ambiguous_groups_alone():
+    source = '<ref group="a">x</ref><ref group="b">y</ref>'
+    text = '<ref group="ä">x</ref><ref group="bë">y</ref>'
+    assert restore_ref_group_names(text, source) == (text, {})
+
+
+def test_drop_stray_reference_lists_removes_lists_the_source_lacks():
+    # Regression (Albert Einstein): the source's one <references> block
+    # came back with a <references group=.../> or <references /> after
+    # every chunk boundary, plus one under a random mid-article heading.
+    source = (
+        "== Life ==\nProse.\n== Notes ==\n{{reflist|group=note|refs=\n<ref name=N>n</ref>\n}}\n"
+        "== References ==\n<references>\n<ref name=A>a</ref>\n<ref name=B>b</ref>\n</references>\n"
+    )
+    text = (
+        '== Jeta ==\n<references group="note" />\nProzë.\n== Shënime ==\n'
+        "{{Reflist|group=note|refs=\n<ref name=N>n</ref>\n}}\n"
+        '== Referime ==\n<references>\n<ref name=A>a</ref>\n</references>\n<references group="note"/>\n'
+        '<ref name=B>b</ref>\n<references group="note"></references>\n<references />\n'
+    )
+    patched, removed = drop_stray_reference_lists(text, source)
+    assert removed == 4
+    assert patched == (
+        "== Jeta ==\nProzë.\n== Shënime ==\n{{Reflist|group=note|refs=\n<ref name=N>n</ref>\n}}\n"
+        "== Referime ==\n<references>\n<ref name=A>a</ref>\n</references>\n<ref name=B>b</ref>\n"
+    )
+
+
+def test_drop_stray_reference_lists_keeps_lists_the_source_has():
+    source = "a\n== Notes ==\n{{notelist}}\n== References ==\n{{reflist}}\n"
+    text = "a\n== Shënime ==\n{{Notelist}}\n== Referime ==\n{{Reflist}}\n"
+    assert drop_stray_reference_lists(text, source) == (text, 0)
+
+
+def test_drop_stray_reference_lists_keeps_the_last_of_duplicates():
+    source = "x\n{{reflist}}\n"
+    text = "x\n{{Reflist}}\ny\n{{Reflist}}\n"
+    assert drop_stray_reference_lists(text, source) == ("x\ny\n{{Reflist}}\n", 1)
+
+
+def test_extend_references_block_over_trailing_defs():
+    text = (
+        "== Referime ==\n<references>\n<ref name=A>a</ref>\n</references>\n"
+        "<!-- shënim i modelit -->\n<ref name=B>b</ref>\n\n<ref name=C>c</ref>\n=== Veprat ===\n"
+    )
+    patched, moved = extend_references_block_over_trailing_defs(text)
+    assert moved == 2
+    assert patched == (
+        "== Referime ==\n<references>\n<ref name=A>a</ref>\n"
+        "<!-- shënim i modelit -->\n<ref name=B>b</ref>\n\n<ref name=C>c</ref>\n</references>\n"
+        "=== Veprat ===\n"
+    )
+
+
+def test_extend_references_block_leaves_prose_after_block_alone():
+    text = "<references>\n<ref name=A>a</ref>\n</references>\nProzë.<ref name=B>b</ref>\n"
+    assert extend_references_block_over_trailing_defs(text) == (text, 0)
+
+
+def test_restore_orphaned_ref_definitions_copies_dropped_definition_from_source():
+    # Translation condensed away the sentence carrying the definition but
+    # kept the later reuse — the Soviet Union "Hanson" case.
+    source = (
+        'Second economy.<ref name="Hanson">Hanson, Philip. 2003.</ref>\n'
+        'Later.<ref name="Gregory" /><ref name="Hanson" />\n'
+    )
+    text = 'Më vonë.<ref name="Gregory">G</ref><ref name="Hanson" /> Pastaj.<ref name=Hanson/>\n'
+    patched, restored = restore_orphaned_ref_definitions(text, source)
+    assert restored == ["Hanson"]
+    assert patched == (
+        'Më vonë.<ref name="Gregory">G</ref><ref name="Hanson">Hanson, Philip. 2003.</ref>'
+        " Pastaj.<ref name=Hanson/>\n"
+    )
+
+
+def test_restore_orphaned_ref_definitions_leaves_defined_and_unknown_refs_alone():
+    source = '<ref name="A">a</ref>'
+    text = '<ref name="A" /><ref name=\'A\'>a</ref><ref name="Unknown" />'
+    assert restore_orphaned_ref_definitions(text, source) == (text, [])
+
+
+def test_restore_orphaned_ref_definitions_not_fooled_by_unclosed_definition():
+    # Regression (Albert Einstein): an unclosed definition (its </ref> lost
+    # in translation) used to extend to the next definition's </ref>,
+    # hiding "B" from the defined set, so a duplicate "B" was restored.
+    source = '<ref name="A">a, p. 23.</ref><ref name="B">b</ref>'
+    text = 'Use.<ref name="B"/>\n<references>\n<ref name="A">a, p.\n23.\n<ref name="B">b</ref>\n</references>'
+    assert restore_orphaned_ref_definitions(text, source) == (text, [])
+
+
+@pytest.mark.asyncio
+async def test_assembly_repairs_run_concurrently_up_to_the_limit():
+    in_flight = 0
+    peak = 0
+
+    class SlowClient(FakeOpenRouterClient):
+        async def chat_completion(self, model, messages, temperature=0.0, on_retry=None, usage_out=None):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return "Prozë e pastër.", 100, 50
+
+    chunks = [_chunk("{{harvc|last=Smith}}", order=i) for i in range(5)]
+    await run_assembly_repair(
+        chunks, _FakeSource(), _config(max_assembly_repair_rounds=1, assembly_repair_concurrency=2),
+        SlowClient([]), _skill(), None, FakeMediaWikiClient(raise_if_called=True), None, RunStats(),
+    )
+
+    assert peak == 2
+    assert all(c.translated_text == "Prozë e pastër." for c in chunks)

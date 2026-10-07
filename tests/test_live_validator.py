@@ -61,6 +61,20 @@ def test_orphaned_named_ref_detected_despite_wrapping_span():
     assert "Gabim citimi" in issues[0].message
 
 
+def test_repeated_cite_error_reported_once():
+    # Cite renders one error span per use of a broken named ref; a ref
+    # reused several times must still produce a single finding.
+    span = (
+        '<span class="error mw-ext-cite-error" lang="sq" dir="ltr">'
+        "Gabim citimi: Etiketë <code>&lt;ref&gt;</code> e pavlefshme; "
+        'asnjë tekst nuk u dha për refs e quajtura "x"</span>'
+    )
+    parse_result = {"text": "<p>" + span * 9 + "</p>", "templates": []}
+    issues = find_live_issues(parse_result)
+    assert len(issues) == 1
+    assert issues[0].kind == "orphaned_named_ref"
+
+
 def test_unexpanded_template_locates_template_syntax_not_prose_word():
     """Regression test: a missing template named '\"' or 'Main' must match
     the actual {{'\"}} or {{Main}} template invocation, not an unrelated

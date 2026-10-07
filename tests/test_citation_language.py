@@ -8,6 +8,8 @@ from wiki_translation_harness.citation_language import (
     fill_missing_citation_languages,
     fix_citation_param_names,
     guess_language_from_title,
+    convert_nested_ref_notes_to_refn,
+    convert_nested_sfn_to_harvnb,
     unwrap_redundant_sfn_ref,
 )
 
@@ -188,3 +190,44 @@ def test_unwrap_redundant_sfn_ref_leaves_extra_prose_untouched():
     assert result.unwrapped == []
 
 
+
+
+def test_convert_nested_sfn_to_harvnb_renames_bundled_calls_inside_ref():
+    text = "A.<ref>{{Sfn|Lane Fox|1980|pp=65–66}}, {{sfnp|Renault|2001|p=44}}</ref> B.{{sfn|Roisman|2010|p=1}}"
+    result = convert_nested_sfn_to_harvnb(text)
+    assert result.patched_wikitext == (
+        "A.<ref>{{harvnb|Lane Fox|1980|pp=65–66}}, {{harvp|Renault|2001|p=44}}</ref> B.{{sfn|Roisman|2010|p=1}}"
+    )
+    assert len(result.converted) == 2
+
+
+def test_convert_nested_sfn_to_harvnb_preserves_name_spacing_and_leaves_bare_sfn():
+    text = '<ref name="x">{{Sfn |A|1999|p=2}} note</ref>{{Sfn|B|2000|p=3}}'
+    result = convert_nested_sfn_to_harvnb(text)
+    assert result.patched_wikitext == '<ref name="x">{{harvnb |A|1999|p=2}} note</ref>{{Sfn|B|2000|p=3}}'
+
+
+def test_convert_nested_ref_notes_to_refn_restores_refn():
+    # Albert Einstein / Vietnam War: {{refn|group=note|...<ref>..</ref>}}
+    # came back as a <ref> nested inside a <ref>, which Cite can't parse.
+    text = (
+        'Spy;<ref group="A" name="start date">Claim | per [[a|b]].<ref>{{cite web|title=T}}</ref>'
+        '<ref name="x" /></ref> next.<ref>{{cite web|title=U}}</ref>'
+    )
+    result = convert_nested_ref_notes_to_refn(text)
+    assert result.converted == ['<ref group="A" name="start date">']
+    assert result.patched_wikitext == (
+        "Spy;{{refn|group=A|name=start date|1=Claim {{!}} per [[a|b]].<ref>{{cite web|title=T}}</ref>"
+        '<ref name="x" />}} next.<ref>{{cite web|title=U}}</ref>'
+    )
+
+
+def test_convert_nested_ref_notes_to_refn_ignores_cut_definitions_and_plain_refs():
+    # A ref definition cut by chunking (no closer on its line) must not be
+    # taken for a note wrapping the next definition.
+    text = (
+        '<ref name="a">van Dongen, p.\n23.\n<ref name="b">{{cite book|title=B}}</ref>\n'
+        "x.<ref>A</ref><ref>B</ref></ref>"
+    )
+    assert convert_nested_ref_notes_to_refn(text).patched_wikitext == text
+    assert convert_nested_ref_notes_to_refn(text).converted == []

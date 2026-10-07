@@ -138,6 +138,10 @@ def find_live_issues(parse_result: dict, source_text: str = "") -> list[Validati
     issues: list[ValidationIssue] = []
     html = parse_result.get("text", "") or ""
 
+    # Cite renders one error span per *use* of a broken named ref, so a ref
+    # reused nine times yields nine identical messages. One finding per
+    # distinct message is enough; duplicates only bloat the repair prompt.
+    seen_cite_msgs: set[str] = set()
     for match in _ERROR_SPAN_RE.finditer(html):
         cls = match.group("cls").lower()
         msg = _strip_html(match.group("msg"))
@@ -161,6 +165,9 @@ def find_live_issues(parse_result: dict, source_text: str = "") -> list[Validati
             # localized message text — "ref" survives translation into
             # Albanian inside the literal `<ref>` tag mention, so this
             # heuristic holds there, but isn't guaranteed on every wiki.
+            if msg in seen_cite_msgs:
+                continue
+            seen_cite_msgs.add(msg)
             kind = "orphaned_named_ref" if "ref" in msg.lower() else "cite_error"
             line, snippet = _locate(source_text, msg[:40])
             issues.append(
