@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-07
+
 ### Fixed
 - **Review pass no longer undoes post-processing**: after a review-driven repair, `run_review_pass` rebuilt the article with plain `assemble_chunks()`, so the saved file lost every `_post_process` fix (filled `|language=`, sfn renames, restored refs, reference-list repairs). The fixes now live in module-level `pipeline.post_process_assembled`, which both loops call after reassembling, along with comment reconciliation; comments removed during review are added to the report.
 - **Reference lists invented at chunk boundaries removed** (`pipeline.py` `_post_process`): when a list-defined `<references>` block is split across chunks, the model ends each later piece with its own `<references />` / `<references group="…"/>`, so every definition after the first chunk falls outside the block. `restore_ref_group_names` maps a translated group name back to the source's (`group="shënim"` → `note`), `drop_stray_reference_lists` keeps only as many renderers per group as the source has, and `extend_references_block_over_trailing_defs` moves `</references>` past the definitions (and model comments) left trailing after it. Albert Einstein: 96 live Cite findings → 6, all of them real dropped citations.

@@ -1,6 +1,6 @@
 [project]
 name = "wiki-translation-harness"
-version = "0.1.0"
+version = "0.3.0"
 description = "Batch tool that translates Wikipedia articles into wikitext for another language edition (built for English to Albanian). Verifies links and templates, validates and repairs the output, and never publishes: a person reviews every file."
 requires-python = ">=3.11"
 readme = "README.md"
