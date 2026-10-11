@@ -87,6 +87,27 @@ def _language_breakdown(translated_text: str) -> dict[str, int]:
     return counts
 
 
+def build_review_section(review_model: str, review_findings: list[ValidationIssue]) -> list[str]:
+    """Lines of the report's "Semantic review" section."""
+    lines = ["## Semantic review\n"]
+    if review_findings:
+        lines.append(
+            f"Reviewed by `{review_model}`; {len(review_findings)} finding(s) "
+            "remained unresolved after the review repair-attempt cap — spot-check before "
+            "publishing.\n"
+        )
+        lines.append("| severity | explanation | snippet |")
+        lines.append("|---|---|---|")
+        for issue in review_findings:
+            finding = issue.as_finding()
+            snippet = (finding["snippet"] or "").replace("|", "\\|").replace("\n", " ")
+            explanation = finding["explanation"].replace("|", "\\|")
+            lines.append(f"| {finding['severity']} | {explanation} | `{snippet}` |")
+    else:
+        lines.append(f"Reviewed by `{review_model}` — no unresolved findings.")
+    return lines
+
+
 def build_article_report(data: ArticleReportData, assembled_text: str) -> str:
     source = data.source
     facts = data.facts
@@ -206,22 +227,7 @@ def build_article_report(data: ArticleReportData, assembled_text: str) -> str:
         lines.append("")
 
     if data.review_model:
-        lines.append("## Semantic review\n")
-        if data.review_findings:
-            lines.append(
-                f"Reviewed by `{data.review_model}`; {len(data.review_findings)} finding(s) "
-                "remained unresolved after the review repair-attempt cap — spot-check before "
-                "publishing.\n"
-            )
-            lines.append("| severity | explanation | snippet |")
-            lines.append("|---|---|---|")
-            for issue in data.review_findings:
-                finding = issue.as_finding()
-                snippet = (finding["snippet"] or "").replace("|", "\\|").replace("\n", " ")
-                explanation = finding["explanation"].replace("|", "\\|")
-                lines.append(f"| {finding['severity']} | {explanation} | `{snippet}` |")
-        else:
-            lines.append(f"Reviewed by `{data.review_model}` — no unresolved findings.")
+        lines.extend(build_review_section(data.review_model, data.review_findings))
         lines.append("")
 
     attribution_block = build_attribution_block(source)

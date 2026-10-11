@@ -18,7 +18,7 @@
 # meaning "let opencode pick" for opencode_go, deepseek/deepseek-v3.2
 # otherwise) rather than silently reusing whatever model id you had for the
 # other provider.
-provider: claude_code
+provider: codex
 # If a call to `provider` fails with an insufficient-credits error (e.g.
 # OpenRouter HTTP 402, or Claude Code hitting its own account-level
 # session/spend limit), the harness offers to switch engines mid-run rather
@@ -64,8 +64,8 @@ max_repair_attempts: 2
 # complex_model is set); review_provider defaults to complex_provider,
 # then provider. Unresolved findings after review_max_repair_attempts
 # don't block delivery -- see review_queue.record_review_flags.
-# review_model: claude-sonnet-5-5
-# review_provider: claude_code
+review_model: claude-sonnet-5-5
+review_provider: claude_code
 # review_max_repair_attempts: 2
 #
 # Full example of the 3-tier "cheap draft, strong complex/review" pattern
@@ -104,8 +104,9 @@ skill_path:
 # Loaded the same way as skill_path but only ever reaches a repair call
 # (see build_repair_messages) — never sent on a normal translation call, so
 # most sections (which never fail validation) never pay for its tokens.
-# Set to null/remove to disable it and rely solely on skill_path's content
-# plus the specific validation errors listed during repair.
+# MANDATORY: the run fails at startup if this can't be loaded, and every
+# article also passes the deterministic wikiqa checks (qa.py) before it is
+# saved — a failing article goes to needs_human_review instead.
 qa_skill_path: ~/.claude/skills/wikiqa
 # On: sqwiki-verified.md's confirmed template names/params reach the model.
 # Costs more tokens per request; off falls back to guessing on anything not

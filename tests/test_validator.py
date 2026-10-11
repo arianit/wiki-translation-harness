@@ -204,3 +204,18 @@ def test_normal_long_prose_not_flagged_as_degenerate_repetition():
     )
     result = validate_wikitext(text)
     assert result.valid
+
+
+def test_balance_findings_preserve_lines_after_verbatim_blocks():
+    result = validate_wikitext('<math>\n[[ignored]]\n</math>\nClean [[link]].\nextra]]\n')
+    issue = next(i for i in result.issues if i.kind == 'link')
+    assert issue.line_number == 5
+    assert 'extra' not in issue.snippet
+    assert issue.snippet.startswith(']]')
+
+
+def test_unmatched_ref_reports_owning_line():
+    result = validate_wikitext('Clean <ref>citation</ref>\nExtra </ref>')
+    issue = next(i for i in result.issues if i.kind == 'reference')
+    assert issue.line_number == 2
+    assert issue.snippet == '</ref>'

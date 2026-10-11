@@ -53,12 +53,13 @@ class MediaWikiClient:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
-    async def fetch_article(self, title: str) -> ArticleSource:
-        """Fetch raw wikitext + revid/timestamp for a single title via action=query."""
+    async def fetch_article(self, title: str, revid: int | None = None) -> ArticleSource:
+        """Fetch raw wikitext + revid/timestamp for a single title via action=query.
+        With `revid`, fetches that exact revision instead of the current one."""
         params = {
             "action": "query",
             "prop": "revisions",
-            "titles": title,
+            "revids" if revid else "titles": revid or title,
             "rvprop": "content|ids|timestamp",
             "rvslots": "main",
             "formatversion": "2",

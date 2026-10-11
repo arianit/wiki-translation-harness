@@ -90,6 +90,16 @@ def build_config(
     # straight to the Claude Code CLI, which rejected it as
     # claude-code:unrecognized_model.
     overrides = overrides or {}
+    # An explicit provider selection applies to every stage unless the
+    # caller also explicitly opts into a separate stage model/provider.
+    # Otherwise YAML's secondary providers silently survive --provider.
+    if overrides.get("provider") is not None:
+        active_stages = {"complex": bool(data.get("complex_model")),
+                         "review": bool(data.get("review_model") or data.get("complex_model"))}
+        for stage in ("complex", "review"):
+            if active_stages[stage] and not any(overrides.get(f"{stage}_{field}") is not None for field in ("model", "provider")):
+                data[f"{stage}_provider"] = overrides["provider"]
+                data[f"{stage}_model"] = overrides.get("model") or default_model_for_provider(overrides["provider"])
     if overrides.get("provider") is not None and overrides.get("model") is None:
         data.pop("model", None)
 

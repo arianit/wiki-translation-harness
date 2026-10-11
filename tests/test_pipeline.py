@@ -168,7 +168,7 @@ async def test_only_the_affected_chunk_gets_repaired():
 
 @pytest.mark.asyncio
 async def test_live_validate_enabled_issue_repairs_via_live_check():
-    chunk = _chunk("{{NonExistentTemplateXYZ}}")
+    chunk = _chunk("{{NonExistentTemplateXYZ}} {{Reflist}}")
     # First parse: reports the template as missing (drives one repair round).
     # Second parse (post-repair): clean.
     mw_client = FakeMediaWikiClient(
@@ -177,7 +177,7 @@ async def test_live_validate_enabled_issue_repairs_via_live_check():
             {"text": "<p>clean</p>", "templates": [{"ns": 10, "title": "Stampa:Sfn", "exists": True}]},
         ]
     )
-    client = FakeOpenRouterClient(["Fixed: {{Sfn|Smith|2020}}"])
+    client = FakeOpenRouterClient(["Fixed: {{Sfn|Smith|2020}} {{Reflist}}"])
     stats = RunStats()
 
     assembled, issues, rounds, _, _ = await run_assembly_repair(
@@ -227,7 +227,7 @@ async def test_unlocalized_ref_issue_only_reaches_chunk_mentioning_that_ref():
     # message names `<ref name="RefA"/>` — the finding should reach ONLY the
     # chunk whose text mentions that ref, not every chunk.
     clean = _chunk("Prozë krejt e pastër.", order=0)
-    with_ref = _chunk("Vijazimi.\nKjo qe e dhëna.<ref name=\"RefA\"/>\n", order=1)
+    with_ref = _chunk("Vijazimi.\nKjo qe e dhëna.<ref name=\"RefA\"/>\n{{Reflist}}\n", order=1)
     orphaned_ref_html = (
         '<span class="error mw-ext-cite-error">Gabim citimi: Etiketë &lt;ref&gt; e '
         'pavlefshme;\nasnjë tekst nuk u dha për refs e quajtura "RefA"</span>'
@@ -326,24 +326,24 @@ async def test_review_pass_reapplies_post_processing_after_repair():
     # Regression: the review pass used to reassemble with plain
     # assemble_chunks(), so a review repair silently undid every
     # post-processing fix in the saved article.
-    chunk = _chunk("Parisi eshte nje qytet.{{sfn|Smith|2020|f=5}}")
-    chunk.text = "Paris is a city.{{sfn|Smith|2020|p=5}}"
+    chunk = _chunk("Parisi eshte nje qytet.{{sfn|Smith|2020|f=5}} {{Reflist}}")
+    chunk.text = "Paris is a city.{{sfn|Smith|2020|p=5}} {{Reflist}}"
     client = FakeOpenRouterClient(
         [
             '[{"kind": "grammar_case", "message": "Wrong case.", "snippet": "Parisi eshte"}]',
             # The repair keeps the mistranslated |f= and adds a note of its own.
-            "Parisi është një qytet.{{sfn|Smith|2020|f=5}}<!-- rregullova rasën -->",
+            "Parisi është një qytet.{{sfn|Smith|2020|f=5}} {{Reflist}}<!-- rregullova rasën -->",
             "[]",
         ]
     )
 
     assembled, issues, _, removed_comments = await run_review_pass(
-        [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Parisi eshte nje qytet.{{sfn|Smith|2020|p=5}}",
+        [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Parisi eshte nje qytet.{{sfn|Smith|2020|p=5}} {{Reflist}}",
         client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), RunStats(), VerifiedFacts(),
     )
 
     assert issues == []
-    assert assembled == "Parisi është një qytet.{{sfn|Smith|2020|p=5}}"
+    assert assembled == "Parisi është një qytet.{{sfn|Smith|2020|p=5}} {{Reflist}}"
     assert removed_comments == ["rregullova rasën"]
 
 
@@ -563,3 +563,105 @@ async def test_assembly_repairs_run_concurrently_up_to_the_limit():
 
     assert peak == 2
     assert all(c.translated_text == "Prozë e pastër." for c in chunks)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('limited_stage', ['review', 'complex'])
+async def test_secondary_limit_retries_on_primary(tmp_path, monkeypatch, limited_stage):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import wiki_translation_harness.pipeline as pipeline
+    from wiki_translation_harness.engines import ClientPool
+    from wiki_translation_harness.models import ArticleSource, InsufficientCreditsError, ChunkStatus
+    from wiki_translation_harness.sources import ArticleInput
+
+    cfg = _config(provider='codex', model='gpt-6-luna',
+                  complex_provider='claude_code', complex_model='claude-sonnet-5-5',
+                  review_provider='claude_code', review_model='claude-sonnet-5-5',
+                  cache=False, verify_links=False, fill_citation_languages=False, user_agent='test-harness',
+                  generate_reports=False,
+                  output_dir=tmp_path / 'output', partial_output_dir=tmp_path / 'partial',
+                  stats_path=tmp_path / 'stats.json')
+    primary = SimpleNamespace(get_pricing_for=AsyncMock(return_value=None), aclose=AsyncMock())
+    secondary = SimpleNamespace(get_pricing_for=AsyncMock(return_value=None), aclose=AsyncMock())
+    monkeypatch.setattr(pipeline, 'build_client_pool', lambda config: (ClientPool({'codex': primary, 'claude_code': secondary}), config))
+    monkeypatch.setattr(pipeline, 'load_skill', lambda *args: _skill())
+    chunk = _chunk('Translated text')
+    chunk.is_complex = limited_stage == 'complex'
+    source = ArticleSource(title='Test Article', wikitext='English text')
+    monkeypatch.setattr(pipeline, '_plan_article', AsyncMock(return_value=(source, [chunk], VerifiedFacts())))
+    translation_calls = []
+
+    async def translate(chunk, config, *args, **kwargs):
+        translation_calls.append(config.complex_provider)
+        if limited_stage == 'complex' and config.complex_provider == 'claude_code':
+            raise InsufficientCreditsError('weekly limit')
+        chunk.status = ChunkStatus.TRANSLATED
+        return SimpleNamespace(validation=SimpleNamespace(valid=True), prompt_tokens=10, completion_tokens=10)
+
+    monkeypatch.setattr(pipeline, 'translate_chunk', translate)
+    monkeypatch.setattr(pipeline, 'run_assembly_repair', AsyncMock(return_value=('Translated text', [], 0, 0, [])))
+    monkeypatch.setattr(pipeline, 'post_process_assembled', AsyncMock(return_value=('Translated text', 0)))
+    review_calls = []
+
+    async def review(chunks, source, config, assembled, client, model, *args):
+        review_calls.append((client, model))
+        if client is secondary:
+            raise InsufficientCreditsError('weekly limit')
+        return assembled, [], 0, []
+
+    monkeypatch.setattr(pipeline, 'run_review_pass', review)
+    result = await pipeline.run_pipeline(cfg, [ArticleInput(source.title)], resume_unfinished=False)
+    assert result.stats.articles_completed == 1
+    assert review_calls[-1] == (primary, 'gpt-6-luna')
+    assert result.stats.review_provider == 'codex'
+    assert result.stats.review_model == 'gpt-6-luna'
+    if limited_stage == 'review':
+        assert len(review_calls) == 2
+    else:
+        assert translation_calls == ['claude_code', 'codex']
+
+@pytest.mark.asyncio
+async def test_unbalanced_link_only_repairs_owning_chunk():
+    a = _chunk('Clean [[link]].', order=0)
+    b = _chunk('Broken link]].', order=1)
+    client = FakeOpenRouterClient(['Fixed [[link]].'])
+    assembled, issues, _, _, _ = await run_assembly_repair(
+        [a, b], _FakeSource(), _config(), client, _skill(), None,
+        FakeMediaWikiClient(raise_if_called=True), None, RunStats(),
+    )
+    assert not issues
+    assert len(client.calls) == 1
+    assert a.translated_text == 'Clean [[link]].'
+
+
+@pytest.mark.asyncio
+async def test_rendered_harvc_error_does_not_broadcast_to_clean_chunks():
+    a = _chunk('Clean prose.', order=0)
+    b = _chunk('{{Harvc|last=Smith|year=2020}}', order=1)
+    client = FakeOpenRouterClient(['{{Cite book|last=Smith|year=2020|title=Book}}'])
+    mw = FakeMediaWikiClient([
+        {'text': '<strong class="error">Script error: No such module &quot;Harvc&quot;.</strong>',
+         'templates': [{'ns': 828, 'title': 'Moduli:Harvc', 'exists': False}]},
+        {'text': '<p>Clean</p>', 'templates': []},
+    ])
+    _, issues, _, _, _ = await run_assembly_repair(
+        [a, b], _FakeSource(), _config(live_validate=True), client, _skill(), None,
+        mw, None, RunStats(),
+    )
+    assert not issues
+    assert len(client.calls) == 1
+    assert a.translated_text == 'Clean prose.'
+
+
+@pytest.mark.asyncio
+async def test_missing_unlocated_module_retains_error_without_model_calls():
+    mw = FakeMediaWikiClient([{'text': '<p>Clean</p>', 'templates': [
+        {'ns': 828, 'title': 'Moduli:Cite', 'exists': False},
+    ]}])
+    client = FakeOpenRouterClient([])
+    _, issues, _, _, _ = await run_assembly_repair(
+        [_chunk('Clean prose.')], _FakeSource(), _config(live_validate=True),
+        client, _skill(), None, mw, None, RunStats(),
+    )
+    assert issues
+    assert not client.calls

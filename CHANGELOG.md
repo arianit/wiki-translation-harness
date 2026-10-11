@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **QA is mandatory.** New `qa.py` ports wikiqa's grep-able checks (`grc` in `|language=`, month-only/Albanian-month dates, `{{Shih edhe}}`, wrapped hatnote params, broken `{{transliteration}}`/`{{tlit}}`/`{{native name}}`/`{{cite tweet}}`, `|miniaturë|`, `{{cite web}}` without `|url=`, orphaned `access-date`/`archive-url`, duplicated `{{Sfnmp}}` year params, missing `{{Reflist}}`). They run inside `_validate_assembled`, so assembly and review repair rounds see them, and again as a final gate before save; a failing article is recorded in `needs_human_review` and not saved. `qa_skill_path` can no longer be `null` and a missing wikiqa skill fails the run at startup.
+
 ## [0.3.0] - 2026-10-07
 
 ### Fixed

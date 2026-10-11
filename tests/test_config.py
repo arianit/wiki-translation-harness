@@ -113,3 +113,26 @@ def test_claude_code_effort_defaults_to_medium():
     assert cfg.claude_code_effort == "medium"
 
 
+@pytest.mark.parametrize('with_model', [True, False])
+def test_explicit_provider_overrides_yaml_secondary_stages(tmp_path, with_model):
+    path = tmp_path / 'config.yaml'
+    path.write_text('provider: codex\nmodel: gpt-6-luna\ncomplex_provider: claude_code\ncomplex_model: claude-sonnet-5-5\nreview_provider: claude_code\nreview_model: claude-sonnet-5-5\n')
+    overrides = {**_CONTACT, 'provider': 'codex'}
+    if with_model:
+        overrides['model'] = 'chosen-model'
+    cfg = build_config(path, overrides)
+    assert cfg.complex_provider == cfg.review_provider == 'codex'
+    assert cfg.complex_model == cfg.review_model == cfg.model
+
+
+def test_explicit_secondary_stage_survives_provider_override(tmp_path):
+    cfg = build_config(None, {**_CONTACT, 'provider': 'codex', 'review_provider': 'claude_code', 'review_model': 'claude-sonnet-5-5'})
+    assert cfg.review_provider == 'claude_code'
+    assert cfg.review_model == 'claude-sonnet-5-5'
+
+
+def test_qa_skill_path_cannot_be_disabled():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Config(qa_skill_path=None)

@@ -32,16 +32,71 @@ def load_queue_lib(repo_dir: Path):
     return module
 
 
+REVIEW_MARKER = "review="
+
+
+def review_marker(model: str, provider: str) -> str:
+    return f"{REVIEW_MARKER}{model}@{provider}"
+
+
 def _status_with_engine(status: str, article_stats: StatsTracker, config: Config) -> str:
     """Appends `model@provider` to a DONE/FAILED status so
     totranslate.txt records which engine actually produced (or failed to
     produce) each result. Prefers the effective provider/model pipeline.py
     stamped on article_stats.stats (reflects a mid-run fallback-provider
     switch, see ensure_fallback_engine); falls back to the run's starting
-    config if the article crashed before that was ever set."""
-    provider = article_stats.stats.provider or config.provider
-    model = article_stats.stats.model or config.model
-    return f"{status}\t{model}@{provider}"
+    config if the article crashed before that was ever set.
+
+    A DONE article that went through the semantic review pass also gets a
+    third field, `review=model@provider`, naming the reviewer."""
+    stats = article_stats.stats
+    provider = stats.provider or config.provider
+    model = stats.model or config.model
+    line = f"{status}\t{model}@{provider}"
+    if status == "DONE" and stats.review_model:
+        line += f"\t{review_marker(stats.review_model, stats.review_provider or provider)}"
+    return line
+
+
+def unreviewed_done_lines(queue_repo_dir: Path, draft_engine: str) -> list[tuple[int, str]]:
+    """[(line_no, url)] of DONE lines produced by `draft_engine` (a
+    `model@provider` string) that carry no `review=` field yet."""
+    queue_lib = load_queue_lib(queue_repo_dir)
+    return [
+        (line_no, url)
+        for line_no, url, status, extra in queue_lib.parse_queue(queue_repo_dir)
+        if status == "DONE" and extra and extra[0] == draft_engine
+        and not any(field.startswith(REVIEW_MARKER) for field in extra[1:])
+    ]
+
+
+def mark_reviewed(
+    queue_repo_dir: Path, url: str, review_model: str, review_provider: str, max_attempts: int = 5
+) -> None:
+    """Adds the `review=model@provider` field to a DONE line and pushes it.
+    Pulls first and re-finds the line by URL, since other machines edit the
+    same file; retries on a push conflict like queue_lib.finish_line."""
+    queue_lib = load_queue_lib(queue_repo_dir)
+    marker = review_marker(review_model, review_provider)
+    for attempt in range(1, max_attempts + 1):
+        queue_lib.git_pull(queue_repo_dir)
+        for line_no, line_url, status, extra in queue_lib.parse_queue(queue_repo_dir):
+            if line_url != url:
+                continue
+            if status != "DONE":
+                raise ValueError(f"{url} is {status or 'pending'} in the queue, not DONE")
+            kept = [field for field in extra if not field.startswith(REVIEW_MARKER)]
+            queue_lib.set_line_status(queue_repo_dir, line_no, "\t".join(["DONE", *kept, marker]))
+            break
+        else:
+            raise ValueError(f"{url} not found in the queue")
+        try:
+            queue_lib.git_commit_push(queue_repo_dir, f"review: {url} -> {marker}")
+            return
+        except queue_lib.QueueSyncError:
+            if attempt == max_attempts:
+                raise
+            queue_lib.git_reset_hard_to_remote(queue_repo_dir)
 
 
 async def run_queue_mode(

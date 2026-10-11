@@ -367,6 +367,12 @@ class Config(BaseModel):
     live_validate: bool = True
     live_validate_timeout_s: float = 30.0
     max_assembly_repair_rounds: int = 3
+    # Off: any finding left after the repair rounds, of any severity, sends
+    # the article to needs_human_review and nothing is saved. On: an article
+    # whose only remaining findings are warnings (a source template or Lua
+    # module that doesn't exist on the target wiki) is saved anyway, with
+    # the findings written to {title}.review-flags.md.
+    save_with_warnings: bool = False
     # Chunks repaired at once within one assembly-repair round. A round on
     # a long article can touch ~20 chunks; repaired one at a time that is
     # ~15 minutes per round.
@@ -405,9 +411,10 @@ class Config(BaseModel):
     )
     # Loaded the same way as skill_path but kept separate and appended only
     # to repair messages (skill_loader.build_repair_messages) — never sent
-    # on a normal translation call. None disables it (repair then relies
-    # solely on skill_path's content plus the specific errors listed).
-    qa_skill_path: Path | list[Path] | None = Field(
+    # on a normal translation call. Mandatory: the run fails at startup if
+    # it can't be loaded, and every article also passes the deterministic
+    # wikiqa gate in qa.py before it is saved.
+    qa_skill_path: Path | list[Path] = Field(
         default_factory=lambda: Path.home() / ".claude" / "skills" / "wikiqa"
     )
     include_skill_references: bool = False

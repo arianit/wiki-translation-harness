@@ -45,6 +45,11 @@ A single chat-completion call has no tools or internet, so the harness:
   `qa_skill_path` (`wikiqa`) only on repair calls, since that checklist is
   only useful once a defect was found. This cuts the system prompt on a
   normal call by about 29%.
+- Runs a mandatory QA pass on every article (`qa.py`, the deterministic
+  half of `wikiqa`): the checks run in every assembly and review repair
+  round, then once more as a final gate before saving. `qa_skill_path` is
+  required, and an article that still fails the gate goes to
+  `needs_human_review` instead of being saved.
 - Does the skill's live lookups itself and passes the results to the model
   as plain facts.
 - Keeps a per-article terminology registry: when a chunk renders an
@@ -197,6 +202,13 @@ provider is picked (`claude-sonnet-5-5`, `deepseek/deepseek-v3.2`,
 `qwen3.8-27b`, or, for `opencode_go`, whatever opencode is configured to
 use).
 
+An explicit `--provider` also selects that provider/model for complex chunks
+and review. To retain a separate stage, pass its `--complex-model` /
+`--complex-provider` or `--review-model` / `--review-provider` explicitly.
+Without `--provider`, the stage routing in YAML is preserved. If a secondary
+provider hits its account limit, complex chunks and review retry on the primary
+provider/model; review on the primary provider uses the configured fallback.
+
 Caveat for `opencode_go`: `opencode run` has no way to turn tools off, so
 pin `opencode_go_agent` to a locked-down agent (see `config.example.yaml`).
 
@@ -288,9 +300,21 @@ wiki-translation-harness queue --provider openrouter --model deepseek/deepseek-v
 Each run pulls the queue repo, claims the first unclaimed line (commits and
 pushes the claim first, so two machines don't take the same article),
 translates it, then marks it `DONE` or `FAILED` along with the engine that
-actually ran (e.g. `DONE\tclaude-sonnet-5-5@claude_code`). A claim older than
+actually ran (e.g. `DONE\tgpt-6-luna@codex`). When the review pass ran, the
+reviewer is added as a third field: `DONE\tgpt-6-luna@codex\treview=claude-sonnet-5-5@claude_code`. A claim older than
 `--stale-hours` (default 3) is treated as abandoned. The clone location is
 `--queue-repo-dir` (default `~/code/wiki-translation-queue`).
+
+### Reviewing finished drafts
+
+`wiki-translation-harness review` runs the review pass over translations that
+were saved without one (by default every `DONE` queue line from
+`--draft-engine gpt-6-luna@codex` that has no `review=` field), against the
+English revision recorded in each file's attribution block. Edits are written
+back to the `.wiki` (the original draft is kept in `output/pre-review/`), the
+report is updated, and the review model is added to the queue line. Use
+`--title` to review specific saved articles, `--no-mark` to leave the queue
+alone.
 
 ## Fact verification
 

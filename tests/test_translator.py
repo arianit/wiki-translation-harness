@@ -211,7 +211,7 @@ def _complex_chunk(text="{{Infobox settlement}}") -> Chunk:
 @pytest.mark.asyncio
 async def test_complex_chunk_routes_to_distinct_complex_client_when_given():
     draft_client = FakeOpenRouterClient([])  # would raise IndexError if called
-    complex_client = FakeOpenRouterClient(["'''Parisi''' është qytet."])
+    complex_client = FakeOpenRouterClient(["{{Infobox settlement}}\n'''Parisi''' është qytet."])
     stats = RunStats()
     outcome = await translate_chunk(
         _complex_chunk(),
@@ -239,7 +239,7 @@ async def test_complex_chunk_repair_also_uses_complex_client():
     complex_client = FakeOpenRouterClient(
         # First response uses {{harvc}}, which validator.py flags unconditionally
         # (broken on sqwiki) -> triggers a repair round; second is clean.
-        ["Bibliografia.\n{{harvc|last=Smith|c=Ch1}}\n", "Bibliografia.\n{{Cite book|last=Smith}}\n"]
+        ["{{Infobox settlement}}\nBibliografia.\n{{harvc|last=Smith|c=Ch1}}\n", "{{Infobox settlement}}\nBibliografia.\n{{Cite book|last=Smith}}\n"]
     )
     stats = RunStats()
     outcome = await translate_chunk(
@@ -256,3 +256,75 @@ async def test_complex_chunk_repair_also_uses_complex_client():
     assert len(complex_client.calls) == 2
     assert outcome.repair_attempts == 1
     assert outcome.validation.valid
+
+@pytest.mark.asyncio
+async def test_invalid_cache_is_repaired_and_replaced(tmp_path):
+    from wiki_translation_harness.cache import compute_key
+    with_cache = TranslationCache(tmp_path / 'c.sqlite3')
+    chunk = _chunk()
+    cfg, skill = _config(), _skill()
+    key = compute_key(cfg.model, chunk.source_lang, cfg.target_lang, chunk.text, skill.content_hash, '')
+    with_cache.set(key, cfg.model, chunk.source_lang, cfg.target_lang, chunk.text, '[[Broken')
+    client = FakeOpenRouterClient(['[[Parisi]] është qytet.'])
+    stats = RunStats()
+    try:
+        result = await translate_chunk(chunk, cfg, client, skill, with_cache, None, stats)
+        assert result.validation.valid
+        assert result.chunk.status == ChunkStatus.REPAIRED
+        assert result.repair_attempts == 1
+        assert stats.cache_hits == 1
+        assert stats.cache_misses == 0
+        assert len(client.calls) == 1
+        assert with_cache.get(key) == '[[Parisi]] është qytet.'
+        assert result.prompt_tokens == 100
+    finally:
+        with_cache.close()
+
+
+def test_reference_definitions_only_detection():
+    from wiki_translation_harness.translator import (
+        is_reference_definitions_only,
+        split_heading_and_reference_definitions,
+    )
+
+    defs = '\n<ref name="a">{{cite web |url=x}}</ref>\n<!-- note -->\n<ref name="b">\n{{cite book |title=y}}\n</ref>\n</references>\n'
+    assert is_reference_definitions_only(defs)
+    assert is_reference_definitions_only('<references>' + defs)
+    assert not is_reference_definitions_only("Some prose.\n" + defs)
+    assert not is_reference_definitions_only("== References ==\n" + defs)
+    assert not is_reference_definitions_only("No refs here")
+
+    heading, rest = split_heading_and_reference_definitions("== References ==\n<references>" + defs)
+    assert heading == "== References =="
+    assert rest.startswith("\n<references>")
+    assert split_heading_and_reference_definitions("Prose\n" + defs) is None
+
+
+def test_keep_source_reference_block_overrides_rewritten_body():
+    from wiki_translation_harness.translator import keep_source_reference_block
+
+    source = '== References ==\n<references>\n<ref name="a">{{cite web |url=x}}</ref>\n'
+    mangled = "== Referime ==\n* {{cite web |url=x}}\n"
+    assert keep_source_reference_block(source, mangled) == "== Referime ==\n<references>\n<ref name=\"a\">{{cite web |url=x}}</ref>\n"
+    assert keep_source_reference_block(source, "no heading\nbody").startswith("== References ==\n<references>")
+    assert keep_source_reference_block("Prose.", "Tekst.") == "Tekst."
+
+
+def test_dropped_infobox_detected_and_restored_after_leading_templates():
+    from wiki_translation_harness.translator import dropped_infoboxes, restore_dropped_infoboxes
+
+    box = "{{Infobox planet\n| name = Mars\n| mass = {{val|6.4|e=23}}\n}}"
+    source = "{{Short description|Planet}}\n" + box + "\n[[File:A.png|thumb|x]]\n'''Mars''' is a planet.\n"
+    dropped = "{{Short description|Planeti}}\n\n[[File:A.png|thumb|x]]\n'''Marsi''' është planet.\n"
+    kept = "{{Short description|Planeti}}\n{{Infobox planet\n| name = Marsi\n}}\n'''Marsi''' është planet.\n"
+
+    assert dropped_infoboxes(source, dropped) == [box]
+    assert dropped_infoboxes(source, kept) == []
+    assert dropped_infoboxes("No infobox here.", dropped) == []
+
+    restored, n = restore_dropped_infoboxes(source, dropped)
+    assert n == 1
+    assert restored.startswith("{{Short description|Planeti}}\n" + box)
+    assert restored.index(box) < restored.index("[[File:A.png")
+    assert dropped_infoboxes(source, restored) == []
+    assert restore_dropped_infoboxes(source, kept) == (kept, 0)

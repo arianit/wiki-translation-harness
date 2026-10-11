@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import time
@@ -59,6 +60,7 @@ from wiki_translation_harness.output import (
 )
 from wiki_translation_harness.parser import build_chunks, split_into_sections
 from wiki_translation_harness.progress import ProgressReporter
+from wiki_translation_harness.qa import run_qa_checks
 from wiki_translation_harness.report import ArticleReportData, build_article_report, save_report
 from wiki_translation_harness.repair import repair_chunk
 from wiki_translation_harness.review import review_article
@@ -116,7 +118,7 @@ def _ref_names_in_message(issue: ValidationIssue) -> list[str]:
     Cite ref error or its message doesn't name one."""
     if issue.kind not in _REF_NAMED_ISSUE_KINDS:
         return []
-    return [m.group(1) for m in _REF_NAME_IN_MESSAGE_RE.finditer(issue.message)]
+    return [html.unescape(m.group(1)) for m in _REF_NAME_IN_MESSAGE_RE.finditer(html.unescape(issue.message))]
 
 
 def _chunk_mentions_ref(chunk: Chunk, ref_name: str) -> bool:
@@ -127,6 +129,7 @@ def _chunk_mentions_ref(chunk: Chunk, ref_name: str) -> bool:
     for text in (chunk.translated_text, chunk.text):
         if not text:
             continue
+        text = html.unescape(text)
         if re.search(
             r"<ref\b[^>\n]*\bname\s*=\s*[\"']" + re.escape(ref_name) + r"[\"']",
             text,
@@ -149,6 +152,9 @@ async def _validate_assembled(
     or timeout is logged and the article proceeds on static checks alone
     rather than blocking the whole run."""
     issues = list(validate_wikitext(text).issues)
+    # Mandatory wikiqa checks (qa.py): never gated on config, and run on
+    # every assembly/review round so repair sees them like any other finding.
+    issues.extend(run_qa_checks(text))
     if live_validate:
         try:
             live_result = await asyncio.wait_for(
@@ -671,6 +677,16 @@ async def run_assembly_repair(
         broadcast_unlocalized: list[str] = []
         targeted_counts: dict[tuple[str, int], int] = {}
         for issue, text_line in unlocalized:
+            # Harvc's rendered Lua/missing-module errors describe the same
+            # localized template defects already sent to their owners.
+            if issue.kind in {"lua_script_error", "unexpanded_template"} and "harvc" in issue.message.lower():
+                if any(i.kind == "harvc_used" and i.line_number is not None for i in combined_issues):
+                    continue
+            # A missing module that has no matching source invocation is
+            # a wiki installation problem. Rewriting every chunk cannot
+            # install it; retain the finding for the human-review report.
+            if issue.kind == "unexpanded_template" and issue.line_number is None and "moduli:" in issue.message.lower():
+                continue
             ref_names = _ref_names_in_message(issue)
             target = next(
                 (
@@ -739,14 +755,21 @@ async def run_assembly_repair(
                         source.title, chunk.order, rounds_used, exc,
                     )
 
-        await asyncio.gather(*(
-            _repair(chunk, errors_for_chunk)
+        repair_targets = [
+            (chunk, errors_for_chunk)
             for chunk in chunks
             if (errors_for_chunk := (
                 localized.get(id(chunk), [])
                 + targeted_unlocalized.get(id(chunk), [])
                 + broadcast_unlocalized
             ))
+        ]
+        if not repair_targets:
+            logger.warning("No actionable chunk repair targets for %r; retaining findings for human review", source.title)
+            break
+        await asyncio.gather(*(
+            _repair(chunk, errors_for_chunk)
+            for chunk, errors_for_chunk in repair_targets
         ))
 
         removed_comments.extend(reconcile_chunk_comments(chunks))
@@ -808,6 +831,7 @@ async def run_review_pass(
     cache: TranslationCache | None = None,
     qa_skill: SkillContent | None = None,
     citation_client: httpx.AsyncClient | None = None,
+    source_text: str | None = None,
 ) -> tuple[str, list[ValidationIssue], int, list[str]]:
     """Independent semantic-fidelity review of an already assembled,
     structurally valid article (see review.py) — the whole-article
@@ -851,7 +875,8 @@ async def run_review_pass(
         stats.review_findings_total += len(findings)
         return findings
 
-    source_text = "\n".join(chunk.text for chunk in chunks)
+    if source_text is None:
+        source_text = "\n".join(chunk.text for chunk in chunks)
     removed_comments: list[str] = []
     assembled = initial_assembled
     review_findings = await _run_review_call(assembled)
@@ -901,6 +926,8 @@ async def run_review_pass(
                     cache.set(
                         key, review_model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text
                     )
+            except InsufficientCreditsError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Review-driven repair failed for %r chunk %d (round %d): %s",
@@ -1016,11 +1043,7 @@ async def run_pipeline(
             return stats_tracker
 
     skill = load_skill(config.skill_path, config.include_skill_references, config.skill_git_ref)
-    qa_skill = (
-        load_skill(config.qa_skill_path, config.include_skill_references, config.skill_git_ref)
-        if config.qa_skill_path is not None
-        else None
-    )
+    qa_skill = load_skill(config.qa_skill_path, config.include_skill_references, config.skill_git_ref)
     cache = TranslationCache(config.cache_db_path) if config.cache else None
     verification_cache = VerificationCache(config.verification_db_path) if config.verify_links else None
 
@@ -1113,6 +1136,28 @@ async def run_pipeline(
         fallback_switched = False
         fallback_declined = False
 
+        async def use_primary_for_secondary(provider: str | None) -> bool:
+            """Stop sending complex/review work to an exhausted secondary account."""
+            nonlocal config, complex_client, complex_pricing
+            nonlocal review_client, review_model, review_provider, review_pricing
+            async with fallback_lock:
+                if provider is None or provider == config.provider:
+                    return False
+                logger.warning(
+                    "Secondary provider %r hit its limit; continuing complex/review work on %r (%s).",
+                    provider, config.provider, config.model,
+                )
+                updates = {}
+                if resolve_complex_provider(config) == provider:
+                    updates.update(complex_provider=config.provider, complex_model=config.model)
+                    complex_client, complex_pricing = llm_client, pricing
+                if review_provider == provider:
+                    review_provider, review_model = config.provider, config.model
+                    review_client, review_pricing = llm_client, pricing
+                    updates.update(review_provider=review_provider, review_model=review_model)
+                config = config.model_copy(update=updates)
+                return True
+
         async def ensure_fallback_engine() -> bool:
             """On the first call, offers (or, non-interactively, just makes)
             a one-way switch from config.provider to config.fallback_provider
@@ -1204,6 +1249,7 @@ async def run_pipeline(
                 return True
 
         async def process_article(source: ArticleSource, chunks: list[Chunk], facts: VerifiedFacts) -> None:
+            nonlocal review_client, review_model, review_provider, review_pricing
             original = next(
                 (item for item, plan in zip(pending_items, planned)
                  if plan is not None and plan[0] is source),
@@ -1229,6 +1275,10 @@ async def run_pipeline(
                         reporter.on_chunk_start(slot_id, chunk.article_title, chunk.section_title)
                     outcome = None
                     for engine_attempt in range(2):  # 1 retry, only after a fallback-provider switch
+                        attempted_provider = (
+                            resolve_complex_provider(config)
+                            if config.complex_model and chunk.is_complex else config.provider
+                        )
                         try:
                             outcome = await translate_chunk(
                                 chunk,
@@ -1249,7 +1299,8 @@ async def run_pipeline(
                             if (
                                 engine_attempt == 0
                                 and isinstance(exc, InsufficientCreditsError)
-                                and await ensure_fallback_engine()
+                                and (await use_primary_for_secondary(attempted_provider)
+                                     or await ensure_fallback_engine())
                             ):
                                 continue
                             chunk.status = ChunkStatus.FAILED
@@ -1350,7 +1401,14 @@ async def run_pipeline(
                 cache, facts, qa_skill,
             )
 
-            if combined_issues:
+            warning_findings = (
+                combined_issues
+                if combined_issues
+                and config.save_with_warnings
+                and all(i.severity == "warning" for i in combined_issues)
+                else []
+            )
+            if combined_issues and not warning_findings:
                 stats.articles_needs_human_review += 1
                 review_path = record_needs_human_review(config.output_dir, source.title, combined_issues, rounds_used)
                 logger.error(
@@ -1366,24 +1424,67 @@ async def run_pipeline(
 
             review_findings: list[ValidationIssue] = []
             if review_model is not None:
-                assembled, review_findings, review_rounds, review_removed_comments = await run_review_pass(
-                    chunks, source, config, assembled, review_client, review_model, skill,
-                    review_pricing, target_mw_client, stats, facts, on_retry, cache, qa_skill,
-                    citation_client,
-                )
+                for review_attempt in range(2):
+                    attempted_provider = review_provider
+                    try:
+                        assembled, review_findings, review_rounds, review_removed_comments = await run_review_pass(
+                            chunks, source, config, assembled, review_client, review_model, skill,
+                            review_pricing, target_mw_client, stats, facts, on_retry, cache, qa_skill,
+                            citation_client,
+                        )
+                        break
+                    except InsufficientCreditsError:
+                        switched = False
+                        if review_attempt == 0:
+                            switched = await use_primary_for_secondary(attempted_provider)
+                            if not switched and await ensure_fallback_engine():
+                                review_client, review_model = llm_client, config.model
+                                review_provider, review_pricing = config.provider, pricing
+                                switched = True
+                        if switched:
+                            # A failed review may already have repaired chunks.
+                            assembled, _ = await post_process_assembled(
+                                assemble_chunks(chunks), source.title, source.wikitext, config, citation_client
+                            )
+                            continue
+                        raise
                 removed_comments.extend(review_removed_comments)
                 if review_findings:
                     stats.articles_flagged_by_review += 1
-                    flags_path = record_review_flags(config.output_dir, source.title, review_findings, review_rounds)
-                    logger.warning(
-                        "Article %r has %d unresolved semantic-review finding(s) after %d round(s) "
-                        "— flagged at %s, saved anyway: %s",
-                        source.title,
-                        len(review_findings),
-                        review_rounds,
-                        flags_path,
-                        "; ".join(f"{i.kind}: {i.message}" for i in review_findings),
-                    )
+            else:
+                review_rounds = 0
+            flagged = warning_findings + review_findings
+            if flagged:
+                flags_path = record_review_flags(
+                    config.output_dir, source.title, flagged, rounds_used + review_rounds
+                )
+                logger.warning(
+                    "Article %r has %d unresolved finding(s) (%d warning(s) left after assembly repair, "
+                    "%d from the semantic review) — flagged at %s, saved anyway: %s",
+                    source.title,
+                    len(flagged),
+                    len(warning_findings),
+                    len(review_findings),
+                    flags_path,
+                    "; ".join(f"{i.kind}: {i.message}" for i in flagged),
+                )
+
+            # Final mandatory QA gate (qa.py): the review pass may have
+            # rewritten chunks after the last assembly-level QA round, and
+            # a review-flagged article is saved anyway -- a QA defect never is.
+            qa_issues = run_qa_checks(assembled)
+            if qa_issues:
+                stats.articles_needs_human_review += 1
+                review_path = record_needs_human_review(config.output_dir, source.title, qa_issues, rounds_used)
+                logger.error(
+                    "Article %r failed the final QA gate — see %s: %s",
+                    source.title,
+                    review_path,
+                    "; ".join(f"{i.kind}: {i.message}" for i in qa_issues),
+                )
+                if reporter is not None:
+                    reporter.on_article_done(source.title, "needs_human_review")
+                return
 
             # Add attribution block as HTML comment at the bottom of the file
             attribution = build_attribution_block(source)

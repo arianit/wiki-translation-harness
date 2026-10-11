@@ -40,7 +40,8 @@ _VERBATIM_TAG_RE = re.compile(
 
 
 def _strip_verbatim_spans(text: str) -> str:
-    return _VERBATIM_TAG_RE.sub("", text)
+    # Preserve offsets and line numbers for localized repair findings.
+    return _VERBATIM_TAG_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
 
 _SNIPPET_MAX = 120
 
@@ -84,10 +85,23 @@ def _check_pair(text: str, open_tok: str, close_tok: str, kind: str, issues: lis
     o = text.count(open_tok)
     c = text.count(close_tok)
     if o != c:
+        stack = []
+        unmatched = []
+        for match in re.finditer(re.escape(open_tok) + "|" + re.escape(close_tok), text):
+            if match.group() == open_tok:
+                stack.append(match.start())
+            elif stack:
+                stack.pop()
+            else:
+                unmatched.append(match.start())
+        offsets = unmatched + stack
+        offset = min(offsets) if offsets else 0
         issues.append(
             ValidationIssue(
                 kind=kind,
                 message=f"Unbalanced {kind}: {o} occurrences of '{open_tok}' vs {c} of '{close_tok}'",
+                line_number=_line_number(text, offset) if kind != "table" else None,
+                snippet=_snippet(text[offset:offset + _SNIPPET_MAX]),
             )
         )
 
@@ -123,6 +137,18 @@ def _check_refs(text: str, issues: list[ValidationIssue]) -> None:
     non_self_closing = [o for o in opens if not o.rstrip().endswith("/>")]
     closes = _REF_CLOSE_RE.findall(text)
     if len(non_self_closing) != len(closes):
+        stack = []
+        unmatched = []
+        for match in re.finditer(r"<ref\b[^>]*>|</ref\s*>", text, re.IGNORECASE):
+            tag = match.group().lower()
+            if tag.startswith("</"):
+                if stack:
+                    stack.pop()
+                else:
+                    unmatched.append(match.start())
+            elif not tag.rstrip().endswith("/>"):
+                stack.append(match.start())
+        offset = min(unmatched + stack)
         issues.append(
             ValidationIssue(
                 kind="reference",
@@ -130,6 +156,8 @@ def _check_refs(text: str, issues: list[ValidationIssue]) -> None:
                     f"Unbalanced <ref> tags: {len(non_self_closing)} opening vs "
                     f"{len(closes)} closing </ref>"
                 ),
+                line_number=_line_number(text, offset),
+                snippet=_snippet(text[offset:offset + _SNIPPET_MAX]),
             )
         )
 

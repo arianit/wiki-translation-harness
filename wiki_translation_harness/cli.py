@@ -62,6 +62,7 @@ def _build_overrides(
     validate: Optional[bool] = None,
     repair: Optional[bool] = None,
     live_validate: Optional[bool] = None,
+    save_with_warnings: Optional[bool] = None,
     provider: Optional[str] = None,
     fallback_provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -80,6 +81,7 @@ def _build_overrides(
         "validate": validate,
         "repair": repair,
         "live_validate": live_validate,
+        "save_with_warnings": save_with_warnings,
         "provider": provider,
         "fallback_provider": fallback_provider,
         "sequential": sequential,
@@ -172,8 +174,20 @@ def main(
         help="Render the assembled article via the target wiki's action=parse API to catch "
         "Lua/Cite errors, missing templates, and leaked flag-template text (see live_validator.py)",
     ),
+    save_with_warnings: Optional[bool] = typer.Option(
+        None,
+        "--save-warnings/--no-save-warnings",
+        help="Save an article whose only remaining findings are warnings (e.g. a template missing on the "
+        "target wiki), writing them to {title}.review-flags.md, instead of sending it to needs_human_review",
+    ),
     config_path: Path = typer.Option(Path("config.yaml"), "--config", help="Path to config.yaml"),
     force: bool = typer.Option(False, "--force", help="Re-translate even if output .wiki already exists"),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Before the requested articles, retry every unfinished article left in partial_output/ "
+        "(default). --no-resume runs only what was asked for.",
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -195,6 +209,7 @@ def main(
         validate=validate,
         repair=repair,
         live_validate=live_validate,
+        save_with_warnings=save_with_warnings,
         provider=provider,
         fallback_provider=fallback_provider,
         base_url=base_url,
@@ -235,7 +250,8 @@ def main(
         stats_tracker = StatsTracker()
         with ProgressReporter(stats_tracker.stats, cfg.workers, console=console) as reporter:
             result = await run_pipeline(
-                cfg, inputs, force=force, reporter=reporter, stats_tracker=stats_tracker
+                cfg, inputs, force=force, reporter=reporter, stats_tracker=stats_tracker,
+                resume_unfinished=resume,
             )
         return result
 
@@ -421,3 +437,67 @@ def queue(
 
 if __name__ == "__main__":
     app()
+
+
+@app.command()
+def review(
+    titles: Optional[list[str]] = typer.Option(
+        None, "--title", help="Saved article(s) to review. Default: every unreviewed DONE queue line from --draft-engine."
+    ),
+    exclude: Optional[list[str]] = typer.Option(
+        None, "--exclude", help="Title(s) to skip when taking articles from the queue (repeatable)."
+    ),
+    draft_engine: str = typer.Option(
+        "gpt-6-luna@codex", "--draft-engine",
+        help="Queue lines marked DONE by this model@provider and lacking a review= field are reviewed.",
+    ),
+    mark: bool = typer.Option(True, "--mark/--no-mark", help="Record the review model on the queue line and push it"),
+    queue_repo_dir: Path = typer.Option(DEFAULT_QUEUE_REPO_DIR, "--queue-repo-dir"),
+    review_model: Optional[str] = typer.Option(None, "--review-model"),
+    review_provider: Optional[str] = typer.Option(None, "--review-provider"),
+    config_path: Path = typer.Option(Path("config.yaml"), "--config", help="Path to config.yaml"),
+) -> None:
+    """Run the semantic review pass over translations that are already
+    saved (e.g. drafted by the cheap model without a review), then mark the
+    review model on their totranslate.txt lines."""
+    from wiki_translation_harness.queue_runner import (
+        mark_reviewed,
+        unreviewed_done_lines,
+    )
+    from wiki_translation_harness.rereview import rereview_articles
+
+    cfg = build_config(config_path, _build_overrides(model=None, review_model=review_model, review_provider=review_provider))
+    setup_logging(cfg.log_dir, console_level=logging.INFO)
+
+    urls: dict[str, str] = {}  # title -> queue URL
+    if titles:
+        todo = list(titles)
+    else:
+        todo = []
+        for _, url in unreviewed_done_lines(queue_repo_dir, draft_engine):
+            _, title = parse_source_ref(url)
+            if title.replace("_", " ") in {e.replace("_", " ") for e in exclude or []}:
+                continue
+            urls[title] = url
+            todo.append(title)
+    if not todo:
+        console.print("Nothing to review.")
+        return
+    console.print(f"Reviewing {len(todo)} article(s): {', '.join(todo)}")
+
+    def on_done(result) -> None:
+        url = urls.get(result.title)
+        if mark and url:
+            try:
+                mark_reviewed(queue_repo_dir, url, result.review_model, result.review_provider)
+            except Exception as exc:  # noqa: BLE001 - the review itself is already saved
+                console.print(f"[red]Could not mark {url} in the queue: {exc}[/red]")
+
+    results, stats_tracker = asyncio.run(rereview_articles(cfg, todo, on_done=on_done))
+    for result in results:
+        console.print(
+            f"{result.title}: {len(result.findings)} unresolved finding(s), "
+            f"{result.rounds} repair round(s), {'changed' if result.changed else 'unchanged'}"
+        )
+    console.print(f"Estimated cost: ${stats_tracker.stats.estimated_cost_usd:.4f}.")
+    _print_model_usage(stats_tracker.stats)

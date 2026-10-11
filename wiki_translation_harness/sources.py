@@ -33,6 +33,7 @@ class ArticleInput:
     title: str
     local_path: Path | None = None  # set for --file/--directory: raw wikitext already on disk
     source_lang: str | None = None  # None = use the run's configured default source_lang
+    revid: int | None = None  # fetch this exact revision instead of the current one
 
 
 def parse_source_ref(raw: str) -> tuple[str | None, str]:
@@ -93,4 +94,4 @@ async def load_article_source(
     if item.local_path is not None:
         text = item.local_path.read_text(encoding="utf-8")
         return ArticleSource(title=item.title, wikitext=text, source_lang=source_lang)
-    return await mw_client.fetch_article(item.title)
+    return await mw_client.fetch_article(item.title, item.revid)

@@ -7,7 +7,11 @@ cache.py, skill_loader.py, openrouter.py, validator.py, and repair.py.
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 from dataclasses import dataclass
+
+import mwparserfromhell as mwp
 
 from wiki_translation_harness.cache import TranslationCache, compute_key
 from wiki_translation_harness.engines import LLMEngineClient
@@ -17,6 +21,101 @@ from wiki_translation_harness.repair import repair_chunk
 from wiki_translation_harness.skill_loader import SkillContent, build_translation_messages
 from wiki_translation_harness.validator import format_errors, validate_wikitext
 from wiki_translation_harness.verification import VerifiedFacts, build_verified_facts_block
+
+
+_REF_DEF_BLOCK_RE = re.compile(r"<ref\b[^>]*?(?<!/)>.*?</ref\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_REFERENCES_TAG_RE = re.compile(r"</?references\b[^>]*>", re.IGNORECASE)
+
+
+def is_reference_definitions_only(text: str) -> bool:
+    """True when a chunk holds nothing but `<ref>` definitions (plus
+    comments and `<references>` tags): citation bodies are kept untranslated
+    anyway, so the model has nothing to add — and given a long run of them
+    it rewrites the block (bullets, dropped `<ref name>` wrappers, invented
+    headings and `{{Reflist}}` calls) in ways no repair pass undoes. A chunk
+    with any other content, a heading included, still goes to the model."""
+    if not _REF_DEF_BLOCK_RE.search(text):
+        return False
+    rest = _REF_DEF_BLOCK_RE.sub("", text)
+    rest = _HTML_COMMENT_RE.sub("", rest)
+    rest = _REFERENCES_TAG_RE.sub("", rest)
+    return not rest.strip()
+
+
+_HEADING_LINE_RE = re.compile(r"^=+[^=\n].*=+[ \t]*$")
+
+
+def split_heading_and_reference_definitions(text: str) -> tuple[str, str] | None:
+    """(heading line, rest) when a chunk is a section heading followed by
+    nothing but reference definitions (see is_reference_definitions_only),
+    else None."""
+    head, sep, rest = text.lstrip("\n").partition("\n")
+    if not sep or not _HEADING_LINE_RE.match(head.strip()):
+        return None
+    if not is_reference_definitions_only(rest):
+        return None
+    return head, sep + rest
+
+
+def keep_source_reference_block(source_text: str, translated_text: str) -> str:
+    """For a heading + reference-definitions chunk, only the heading needs
+    the model: it rewrites the definitions that follow (dropping the
+    <references> opener among other things), so keep the translated
+    heading and the source's block. Any other chunk is returned as is."""
+    split = split_heading_and_reference_definitions(source_text)
+    if split is None:
+        return translated_text
+    source_heading, source_rest = split
+    translated_head = translated_text.lstrip("\n").partition("\n")[0]
+    if not _HEADING_LINE_RE.match(translated_head.strip()):
+        translated_head = source_heading
+    return translated_head + source_rest
+
+
+logger = logging.getLogger(__name__)
+
+_INFOBOX_PREFIXES = ("infobox", "kuti")
+
+
+def _top_level_infoboxes(text: str) -> list[str]:
+    return [
+        str(node)
+        for node in mwp.parse(text).nodes
+        if isinstance(node, mwp.nodes.Template) and str(node.name).strip().lower().startswith(_INFOBOX_PREFIXES)
+    ]
+
+
+def dropped_infoboxes(source_text: str, translated_text: str) -> list[str]:
+    """Top-level infoboxes of the source that the translation lost.
+
+    A big infobox is the first thing a model skips when it condenses a long
+    chunk (Mars: every cached Lead translation had none), and nothing else
+    notices — the refs only the infobox used then render as Cite errors.
+    Compared by count, since the translation may rename the template."""
+    source_boxes = _top_level_infoboxes(source_text)
+    if not source_boxes:
+        return []
+    return source_boxes[len(_top_level_infoboxes(translated_text)):]
+
+
+def restore_dropped_infoboxes(source_text: str, translated_text: str) -> tuple[str, int]:
+    """Put the source's lost infoboxes back, verbatim (parameter names stay
+    English, which sqwiki wants; values are left for review), after the
+    translation's leading templates — where the source keeps them too.
+    Returns (patched_text, restored_count)."""
+    missing = dropped_infoboxes(source_text, translated_text)
+    if not missing:
+        return translated_text, 0
+    pos = offset = 0
+    for node in mwp.parse(translated_text).nodes:
+        text = str(node)
+        offset += len(text)
+        if isinstance(node, (mwp.nodes.Template, mwp.nodes.Comment)):
+            pos = offset
+        elif not (isinstance(node, mwp.nodes.Text) and not text.strip()):
+            break
+    return translated_text[:pos] + "\n" + "\n".join(missing) + translated_text[pos:], len(missing)
 
 
 @dataclass
@@ -44,6 +143,11 @@ async def translate_chunk(
     complex_pricing: ModelPricing | None = None,
     complex_client: LLMEngineClient | None = None,
 ) -> ChunkOutcome:
+    if is_reference_definitions_only(chunk.text):
+        chunk.translated_text = chunk.text
+        chunk.status = ChunkStatus.TRANSLATED
+        return ChunkOutcome(chunk=chunk, validation=ValidationResult(valid=True), from_cache=False, repair_attempts=0)
+
     # Hybrid-model routing: complex chunks use complex_model (and, when the
     # caller passed one, a distinct complex_client -- see
     # engines.build_client_pool/config.resolve_complex_provider) when configured.
@@ -60,32 +164,56 @@ async def translate_chunk(
 
     cached_text = cache.get(key) if cache is not None else None
     if cached_text is not None:
+        cached_text = keep_source_reference_block(chunk.text, cached_text)
+        if dropped_infoboxes(chunk.text, cached_text):
+            logger.warning(
+                "Ignoring cached translation of %r chunk %d: it dropped the source infobox",
+                chunk.article_title, chunk.order,
+            )
+            cached_text = None
+    if cached_text is not None:
         stats.cache_hits += 1
         chunk.translated_text = cached_text
         chunk.status = ChunkStatus.CACHED
         validation = validate_wikitext(cached_text) if config.validate_output else ValidationResult(valid=True)
-        if verified_facts is not None:
-            verified_facts.record_established_renderings(cached_text)
-        return ChunkOutcome(chunk=chunk, validation=validation, from_cache=True, repair_attempts=0, prompt_tokens=0, completion_tokens=0, latency_s=0.0)
+        if validation.valid:
+            if verified_facts is not None:
+                verified_facts.record_established_renderings(cached_text)
+            return ChunkOutcome(chunk=chunk, validation=validation, from_cache=True, repair_attempts=0)
 
-    stats.cache_misses += 1
-
-    messages = build_translation_messages(
-        skill,
-        chunk.source_lang,
-        config.target_lang,
-        chunk.article_title,
-        chunk.section_title,
-        chunk.text,
-        verified_facts_block=facts_block,
-    )
-    result = await run_completion(effective_client, effective_model, messages, config.temperature, effective_pricing, on_retry=on_retry)
-    stats.record_usage(effective_model, result)
-    total_prompt_tokens = result.prompt_tokens
-    total_completion_tokens = result.completion_tokens
-    total_latency = result.latency_s
-
-    translated_text = result.text
+    total_prompt_tokens = total_completion_tokens = 0
+    total_latency = 0.0
+    translated_text = cached_text
+    if cached_text is None:
+        stats.cache_misses += 1
+        messages = build_translation_messages(
+            skill, chunk.source_lang, config.target_lang, chunk.article_title,
+            chunk.section_title, chunk.text, verified_facts_block=facts_block,
+        )
+        result = await run_completion(effective_client, effective_model, messages, config.temperature, effective_pricing, on_retry=on_retry)
+        stats.record_usage(effective_model, result)
+        total_prompt_tokens = result.prompt_tokens
+        total_completion_tokens = result.completion_tokens
+        total_latency = result.latency_s
+        translated_text = result.text
+        if dropped_infoboxes(chunk.text, translated_text):
+            logger.warning(
+                "Translation of %r chunk %d dropped the source infobox; retrying once",
+                chunk.article_title, chunk.order,
+            )
+            result = await run_completion(effective_client, effective_model, messages, config.temperature, effective_pricing, on_retry=on_retry)
+            stats.record_usage(effective_model, result)
+            total_prompt_tokens += result.prompt_tokens
+            total_completion_tokens += result.completion_tokens
+            total_latency += result.latency_s
+            translated_text = result.text
+            translated_text, restored = restore_dropped_infoboxes(chunk.text, translated_text)
+            if restored:
+                logger.warning(
+                    "Restored %d source infobox(es) verbatim into %r chunk %d after a second drop",
+                    restored, chunk.article_title, chunk.order,
+                )
+    translated_text = keep_source_reference_block(chunk.text, translated_text)
     validation = ValidationResult(valid=True)
     repair_attempts = 0
 
