@@ -1,0 +1,43 @@
+<!--
+DRAFT, NOT READY TO PUBLISH.
+Written without being able to open the cited sites (blocked in the build environment). Facts come from
+search-result snippets only. Every <ref> below needs checking against the page, and every |quote= marked
+TODO needs the exact text pasted in. No quote was invented.
+Not checked: sq.wikipedia template names (the infobox name below is the enwiki name), category names,
+link targets.
+Bed and staff figures differ between sources (470/558 vs 426/545); pick one after reading the pages.
+-->
+{{Infobox hospital
+| name         = Spitali Rajonal „Isa Grezda“
+| native_name  = Spitali i Përgjithshëm „Isa Grezda“
+| image        =
+| caption      =
+| location     = [[Gjakova]]
+| country      = [[Kosova]]
+| type         = Spital rajonal
+| beds         = 470 <!-- TODO: kontrollo, burimet japin 470 dhe 426 -->
+| staff        = 558 <!-- TODO: kontrollo, burimet japin 558 dhe 545 -->
+| founded      = 1945–1946 <!-- TODO: kontrollo -->
+| website      =
+}}
+'''Spitali Rajonal „Isa Grezda“''' (i quajtur edhe '''Spitali i Përgjithshëm „Isa Grezda“''') është spitali rajonal i qytetit të [[Gjakova|Gjakovës]] në [[Kosova|Kosovë]]. Mban emrin e [[Isa Grezda|Isa Grezdës]].<ref name="statistikat">{{cite web |url=https://ikshpk.rks-gov.net/wp-content/uploads/2025/04/Vjetari-i-Statistikave-te-Mesnates-se-Spitaleve-Rajonale-2024-dates-07.04.2025.pdf |title=Vjetari i Statistikave të Mesnatës së Spitaleve Rajonale 2024 |publisher=Instituti Kombëtar i Shëndetësisë Publike të Kosovës |date=2025-04-07 |language=sq |quote=TODO}}</ref>
+
+== Emërtimi ==
+Spitali e merr emrin nga [[Isa Grezda]], student dhe aktivist i Lëvizjes Nacionalçlirimtare, i pushkatuar në vitin 1943 në Gjakovë nga autoritetet bashkëpunëtore shqiptare.<ref name="grezda">{{cite web |url=https://sq.wikipedia.org/wiki/Isa_Grezda |title=Isa Grezda |publisher=Wikipedia |language=sq |access-date=2026-10-18 |quote=Spitali i qytetit të Gjakovës mbanë emrin e tij}}</ref> <!-- TODO: zëvendëso me burim të jashtëm, Wikipedia nuk është burim; faqja Isa Grezda nuk ka referime -->
+
+== Historia ==
+Mjekësia institucionale në Gjakovë filloi menjëherë pas [[Lufta e Dytë Botërore|Luftës së Dytë Botërore]], në vitet 1945–1946.<ref name="historia">{{cite web |url=https://www.spitali-gjakove.com/mod.php?mid=3 |title=Spitali Rajonal – Gjakovë |publisher=Spitali Rajonal „Isa Grezda“ |language=sq |access-date=2026-10-18 |quote=TODO}}</ref> Në vitin 1947, pas rinovimit, u vu në shërbim ndërtesa që kishin lënë forcat ushtarake italiane, dhe ajo shërbeu si spital i qytetit deri në vitin 1974.<ref name="historia" /> Në vitet 1970 filloi të funksiononte ndërtesa e sotme, me statusin „Qendër Mjekësore“.<ref name="historia" /> <!-- TODO: verifiko formulimin, nga përmbledhja e kërkimit -->
+
+== Kapacitetet ==
+Sipas burimeve zyrtare, spitali ka rreth 470 shtretër dhe 558 të punësuar.<ref name="shskuk">{{cite web |url=https://shskuk.rks-gov.net/Hospitals/Hospital/spGjakove |title=Spitali i Përgjithshëm në Gjakovë |publisher=Shërbimi Spitalor dhe Klinik Universitar i Kosovës |language=sq |access-date=2026-10-18 |quote=TODO}}</ref> <!-- TODO: një burim tjetër jep 426 shtretër dhe 545 punonjës -->
+
+Në vitin 2016 një njësi italiane e KFOR-it i dhuroi spitalit shtretër dhe djepa për fëmijë.<!-- TODO: fjali e pasigurt nga përmbledhja e kërkimit, rishkruaje ose hiqe pasi të lexosh burimin --><ref name="kfor">{{cite web |url=https://jfcnaples.nato.int/kfor/media-center/archive/news/2016/multinational-battle-group-west-donation-to-gjakovadakovica-hospital.aspx |title=Multinational Battle Group West donation to Gjakova/Djakovica hospital |trans-title=Dhurata e Grupit Shumëkombësh të Luftës Perëndim për spitalin e Gjakovës |publisher=KFOR |date=2016 |language=en |quote=TODO}}</ref>
+
+== Referime ==
+{{reflist}}
+
+== Lidhje të jashtme ==
+* [https://www.spitali-gjakove.com/ Faqja zyrtare]
+
+[[Kategoria:Spitale në Kosovë]]
+[[Kategoria:Gjakova]]
