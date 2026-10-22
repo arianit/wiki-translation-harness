@@ -322,6 +322,49 @@ async def test_review_pass_finds_and_fixes_issue():
 
 
 @pytest.mark.asyncio
+async def test_review_pass_repair_sees_source_and_may_reword():
+    # Regression: review findings used to go through the syntax-only repair
+    # prompt, which told the model to keep all wording, so wording findings
+    # survived every round.
+    chunk = _chunk("Obelisku i Tutmosit III.")
+    chunk.text = "The Obelisk of Theodosius."
+    client = FakeOpenRouterClient(
+        [
+            '[{"kind": "semantic_fidelity", "message": "Wrong obelisk.", "snippet": "Obelisku i Tutmosit III"}]',
+            "Obelisku i Teodosit.",
+            "[]",
+        ]
+    )
+
+    assembled, issues, rounds, _ = await run_review_pass(
+        [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Obelisku i Tutmosit III.",
+        client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), RunStats(), VerifiedFacts(),
+    )
+
+    assert issues == []
+    assert assembled == "Obelisku i Teodosit."
+    repair_messages = client.calls[1]
+    assert "keep all wording" not in repair_messages[0]["content"]
+    assert "The Obelisk of Theodosius." in repair_messages[1]["content"]
+    assert "Wrong obelisk." in repair_messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_review_pass_structural_only_chunk_keeps_syntax_prompt():
+    chunk = _chunk("Parisi [[eshte nje qytet.")
+    client = FakeOpenRouterClient(["[]", "Parisi [[është]] një qytet.", "[]"])
+
+    assembled, issues, rounds, _ = await run_review_pass(
+        [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Parisi [[eshte nje qytet.",
+        client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), RunStats(), VerifiedFacts(),
+    )
+
+    assert rounds == 1
+    assert "keep all wording" in client.calls[1][0]["content"]
+    assert "BEGIN SOURCE WIKITEXT" not in client.calls[1][1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_review_pass_reapplies_post_processing_after_repair():
     # Regression: the review pass used to reassemble with plain
     # assemble_chunks(), so a review repair silently undid every

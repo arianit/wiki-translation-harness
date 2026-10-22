@@ -62,7 +62,7 @@ from wiki_translation_harness.parser import build_chunks, split_into_sections
 from wiki_translation_harness.progress import ProgressReporter
 from wiki_translation_harness.qa import run_qa_checks
 from wiki_translation_harness.report import ArticleReportData, build_article_report, save_report
-from wiki_translation_harness.repair import repair_chunk
+from wiki_translation_harness.repair import repair_chunk, repair_chunk_semantic
 from wiki_translation_harness.review import review_article
 from wiki_translation_harness.review_queue import record_needs_human_review, record_review_flags
 from wiki_translation_harness.skill_loader import SkillContent, load_skill
@@ -844,8 +844,11 @@ async def run_review_pass(
     findings list, not a full retranslation) plus a structural safety-net
     check (a review-driven edit could reintroduce a structural break — must
     not ship that silently), localizes findings to owning chunks, and
-    repairs only those chunks via the existing repair_chunk(), same as
-    run_assembly_repair does for deterministic findings. Capped at
+    repairs only those chunks, same as run_assembly_repair does for
+    deterministic findings -- via repair_chunk_semantic() when the chunk has
+    review findings (the model sees the source section and may reword) and
+    via the syntax-only repair_chunk() when it has only structural errors.
+    Capped at
     config.review_max_repair_attempts.
 
     After a repair round the article is reassembled from the chunks, so
@@ -889,29 +892,54 @@ async def run_review_pass(
     while combined and rounds_used < config.review_max_repair_attempts:
         rounds_used += 1
         _, spans = assemble_chunks_with_spans(chunks)
-        localized, broadcast = _localize_review_issues(combined, assembled, spans)
+        # Structural errors and review findings are localized separately: the
+        # review findings are about wording, so they go to the semantic repair
+        # prompt (source shown, rewording allowed); a chunk with only
+        # structural errors keeps the syntax-only prompt that forbids rewording.
+        structural_localized, structural_broadcast = _localize_review_issues(structural_issues, assembled, spans)
+        review_localized, review_broadcast = _localize_review_issues(review_findings, assembled, spans)
 
         for chunk in chunks:
-            errors_for_chunk = localized.get(id(chunk), []) + broadcast
-            if not errors_for_chunk:
+            structural_for_chunk = structural_localized.get(id(chunk), []) + structural_broadcast
+            findings_for_chunk = review_localized.get(id(chunk), []) + review_broadcast
+            if not structural_for_chunk and not findings_for_chunk:
                 continue
             stats.review_attempts += 1
             try:
-                repair_result = await repair_chunk(
-                    review_client,
-                    skill,
-                    review_model,
-                    config.temperature,
-                    chunk.source_lang,
-                    config.target_lang,
-                    chunk.article_title,
-                    chunk.section_title,
-                    chunk.translated_text or "",
-                    errors_for_chunk,
-                    review_pricing,
-                    on_retry=on_retry,
-                    qa_skill=qa_skill,
-                )
+                if findings_for_chunk:
+                    repair_result = await repair_chunk_semantic(
+                        review_client,
+                        skill,
+                        review_model,
+                        config.temperature,
+                        chunk.source_lang,
+                        config.target_lang,
+                        chunk.article_title,
+                        chunk.section_title,
+                        chunk.text,
+                        chunk.translated_text or "",
+                        findings_for_chunk,
+                        review_pricing,
+                        structural_errors=structural_for_chunk,
+                        on_retry=on_retry,
+                        qa_skill=qa_skill,
+                    )
+                else:
+                    repair_result = await repair_chunk(
+                        review_client,
+                        skill,
+                        review_model,
+                        config.temperature,
+                        chunk.source_lang,
+                        config.target_lang,
+                        chunk.article_title,
+                        chunk.section_title,
+                        chunk.translated_text or "",
+                        structural_for_chunk,
+                        review_pricing,
+                        on_retry=on_retry,
+                        qa_skill=qa_skill,
+                    )
                 stats.record_usage(review_model, repair_result)
                 stats.review_corrections_applied += 1
                 chunk.translated_text = repair_result.text

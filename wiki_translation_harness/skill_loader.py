@@ -95,6 +95,34 @@ corrected MediaWiki wikitext and nothing else.
 """
 
 
+_SEMANTIC_REPAIR_FRAME = """\
+You are being invoked as an automated, non-interactive translation-fix \
+backend by a batch harness, using the same skill instructions below for \
+style and convention context. A reviewer compared a translated MediaWiki \
+section with its source and listed wording problems in the translation: \
+meaning that drifted from the source, inconsistent spellings of a name, \
+wrong grammatical case or agreement, untranslated or mistranslated terms.
+
+Fix the listed findings by changing the wording they point at, checking \
+each fix against the source section you are given. Change only what a \
+finding requires: leave every other sentence, and all markup (templates, \
+links and their targets, references, file names, parameters, tables), exactly \
+as it is. The findings may also include structural errors; fix those the \
+same minimal way.
+
+Findings come from a whole-article review, so some may concern text that \
+is not in this section, or may be mistaken. If a finding does not apply to \
+this section, or the translation is already correct, change nothing for \
+it. When a finding names the article's prevailing form of a name, use that \
+form. Never invent facts, figures or citations that are in neither the \
+source nor the translation. \
+You have no internet access or tools in this call.
+
+Your whole response replaces the section verbatim, so respond with the \
+corrected MediaWiki wikitext and nothing else.
+"""
+
+
 def _strip_frontmatter(text: str) -> str:
     return _FRONTMATTER_RE.sub("", text, count=1)
 
@@ -124,6 +152,8 @@ class SkillContent:
         h.update(_INVOCATION_FRAME.encode("utf-8"))
         h.update(b"\x00")
         h.update(_REPAIR_FRAME.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(_SEMANTIC_REPAIR_FRAME.encode("utf-8"))
         return h.hexdigest()[:16]
 
 
@@ -316,6 +346,51 @@ def build_repair_messages(
         f"Section: {section_title}\n\n"
         f"Validation errors found in the translated wikitext below:\n{error_list}\n\n"
         f"--- BEGIN INVALID TRANSLATED WIKITEXT ---\n{invalid_text}\n--- END INVALID TRANSLATED WIKITEXT ---"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_semantic_repair_messages(
+    skill: SkillContent,
+    source_lang: str,
+    target_lang: str,
+    article_title: str,
+    section_title: str,
+    source_text: str,
+    translated_text: str,
+    findings: list[str],
+    structural_errors: list[str] | None = None,
+    qa_skill: SkillContent | None = None,
+) -> list[dict[str, str]]:
+    """Counterpart to build_repair_messages for the review pass: the model
+    gets the source section next to the translation, because a wording
+    finding ("the source says X, the translation says Y") can only be fixed
+    by looking at both. _REPAIR_FRAME can't serve here -- it tells the model
+    to keep all wording, which is exactly what these findings ask it to
+    change."""
+    system = f"{_SEMANTIC_REPAIR_FRAME}\n\n---\n\n{skill.combined}"
+    if qa_skill is not None:
+        system += (
+            "\n\n---\n\n# Additional QA reference (known defect patterns to watch for while fixing "
+            f"the listed findings)\n\n{qa_skill.combined}"
+        )
+    finding_list = "\n".join(f"- {f}" for f in findings)
+    user = (
+        f"Source language: {source_lang}\n"
+        f"Target language: {target_lang}\n"
+        f"Article title: {article_title}\n"
+        f"Section: {section_title}\n\n"
+        f"Review findings to fix in the translation:\n{finding_list}\n\n"
+    )
+    if structural_errors:
+        error_list = "\n".join(f"- {e}" for e in structural_errors)
+        user += f"Structural errors to fix as well:\n{error_list}\n\n"
+    user += (
+        f"--- BEGIN SOURCE WIKITEXT ---\n{source_text}\n--- END SOURCE WIKITEXT ---\n\n"
+        f"--- BEGIN TRANSLATED WIKITEXT TO FIX ---\n{translated_text}\n--- END TRANSLATED WIKITEXT TO FIX ---"
     )
     return [
         {"role": "system", "content": system},

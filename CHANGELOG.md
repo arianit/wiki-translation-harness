@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Review findings are repaired with a prompt that allows rewording**: `run_review_pass` fed semantic findings (wrong caption, inconsistent spelling, wrong case) to `repair_chunk`, whose `_REPAIR_FRAME` tells the model it is a syntax-repair backend and to "keep all wording exactly as it is", and which showed only the Albanian chunk. The same findings survived every round (Byzantine Empire: three of three flagged after five rounds). New `repair.repair_chunk_semantic` / `skill_loader.build_semantic_repair_messages` / `_SEMANTIC_REPAIR_FRAME` show the model the source section beside the translation, allow minimal rewording, and tell it to leave a finding alone if it does not apply to that section (findings that cannot be localized are still broadcast to every chunk). A chunk with only structural errors keeps the syntax-only prompt. The frame is part of `SkillContent.content_hash`, so cached repairs from the old prompt are not reused.
+
 ### Changed
 - **QA is mandatory.** New `qa.py` ports wikiqa's grep-able checks (`grc` in `|language=`, month-only/Albanian-month dates, `{{Shih edhe}}`, wrapped hatnote params, broken `{{transliteration}}`/`{{tlit}}`/`{{native name}}`/`{{cite tweet}}`, `|miniaturë|`, `{{cite web}}` without `|url=`, orphaned `access-date`/`archive-url`, duplicated `{{Sfnmp}}` year params, missing `{{Reflist}}`). They run inside `_validate_assembled`, so assembly and review repair rounds see them, and again as a final gate before save; a failing article is recorded in `needs_human_review` and not saved. `qa_skill_path` can no longer be `null` and a missing wikiqa skill fails the run at startup.
 

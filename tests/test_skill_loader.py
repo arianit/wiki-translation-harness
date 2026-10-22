@@ -4,6 +4,7 @@ from pathlib import Path
 
 from wiki_translation_harness.skill_loader import (
     build_repair_messages,
+    build_semantic_repair_messages,
     build_translation_messages,
     load_skill,
 )
@@ -215,3 +216,27 @@ def test_git_ref_multi_path_concatenates_committed_content(tmp_path: Path):
     assert "UNCOMMITTED" not in skill.skill_md
     assert "enwiki-sqwiki-translation/notes.md" in skill.reference_texts
     assert "wikiterms/notes.md" in skill.reference_texts
+
+
+def test_semantic_repair_messages_show_source_and_allow_rewording(tmp_path: Path):
+    skill = load_skill(_make_skill_dir(tmp_path), include_references=False)
+    messages = build_semantic_repair_messages(
+        skill, "en", "sq", "Paris", "Lead",
+        "Paris is a big city.", "Parisi është një qytet i vogël.",
+        ["error: says small, source says big"],
+        structural_errors=["link: unbalanced"],
+    )
+    system, user = messages[0]["content"], messages[1]["content"]
+    assert "keep all wording" not in system
+    assert "Translation rules here." in system
+    assert "Paris is a big city." in user
+    assert "Parisi është një qytet i vogël." in user
+    assert "- error: says small, source says big" in user
+    assert "- link: unbalanced" in user
+    assert user.index("BEGIN SOURCE WIKITEXT") < user.index("BEGIN TRANSLATED WIKITEXT TO FIX")
+
+
+def test_semantic_repair_messages_omit_structural_block_when_none(tmp_path: Path):
+    skill = load_skill(_make_skill_dir(tmp_path), include_references=False)
+    messages = build_semantic_repair_messages(skill, "en", "sq", "Paris", "Lead", "A", "B", ["f"])
+    assert "Structural errors" not in messages[1]["content"]
