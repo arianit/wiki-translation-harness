@@ -16,7 +16,7 @@ import time
 import httpx
 
 from wiki_translation_harness.cache import TranslationCache, VerificationCache, compute_key
-from wiki_translation_harness.resume import checkpoint_input, unfinished_inputs, input_key
+from wiki_translation_harness.resume import checkpoint_input, input_key, record_attempt, unfinished_inputs
 from wiki_translation_harness.config import (
     default_model_for_provider,
     resolve_complex_provider,
@@ -1471,6 +1471,7 @@ async def run_pipeline(
                 title=source.title, local_path=original.local_path,
                 source_lang=source.source_lang,
             ))
+            record_attempt(config, source.title)
             article_stats = {
                 'input_tokens': 0,
                 'output_tokens': 0,

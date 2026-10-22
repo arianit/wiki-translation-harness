@@ -36,6 +36,8 @@ provider: codex
 # No `model:` here either, for the same reason -- let it auto-derive.
 workers: 4
 sequential: true
+# Skip an unfinished draft in partial_output/ after this many tries (0 = never skip).
+max_resume_attempts: 3
 temperature: 0
 max_retries: 5
 cache: true

@@ -67,6 +67,7 @@ def _build_overrides(
     fallback_provider: Optional[str] = None,
     base_url: Optional[str] = None,
     sequential: Optional[bool] = None,
+    max_resume_attempts: Optional[int] = None,
 ) -> dict:
     overrides = {
         "model": model,
@@ -85,6 +86,7 @@ def _build_overrides(
         "provider": provider,
         "fallback_provider": fallback_provider,
         "sequential": sequential,
+        "max_resume_attempts": max_resume_attempts,
     }
     overrides = {k: v for k, v in overrides.items() if v is not None}
     if base_url is not None:
@@ -190,6 +192,12 @@ def main(
         help="Resume unfinished requested articles (default). --no-resume starts only new work; "
         "unrelated partial articles are never picked up by an explicit title/category run.",
     ),
+    max_resume_attempts: Optional[int] = typer.Option(
+        None,
+        "--max-resume-attempts",
+        help="Skip an unfinished draft in partial_output/ after this many tries (default 3 from config; "
+        "0 = never skip). Articles named with --title are always attempted.",
+    ),
     fresh: bool = typer.Option(
         False,
         "--fresh",
@@ -215,6 +223,7 @@ def main(
 
     overrides = _build_overrides(
         model=model,
+        max_resume_attempts=max_resume_attempts,
         complex_model=complex_model,
         complex_provider=complex_provider,
         review_model=review_model,
@@ -434,6 +443,12 @@ def queue(
     validate: Optional[bool] = typer.Option(None, "--validate/--no-validate"),
     repair: Optional[bool] = typer.Option(None, "--repair/--no-repair"),
     live_validate: Optional[bool] = typer.Option(None, "--live-validate/--no-live-validate"),
+    max_resume_attempts: Optional[int] = typer.Option(
+        None,
+        "--max-resume-attempts",
+        help="Skip an unfinished draft in partial_output/ after this many tries (default 3 from config; "
+        "0 = never skip). Articles named with --title are always attempted.",
+    ),
     fresh: bool = typer.Option(
         False,
         "--fresh",
@@ -450,6 +465,7 @@ def queue(
 
     overrides = _build_overrides(
         model=model,
+        max_resume_attempts=max_resume_attempts,
         complex_model=complex_model,
         complex_provider=complex_provider,
         review_model=review_model,

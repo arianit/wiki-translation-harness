@@ -329,6 +329,11 @@ Without it (default), unfinished local drafts are retried first and
 abandoned claims are picked up, so a run can resume or duplicate work
 another agent started.
 
+An unfinished draft is retried at most 3 times (`max_resume_attempts` in the
+config, or `--max-resume-attempts N`; `0` = no limit). After that the backlog
+skips it with a warning naming it, so a draft that keeps failing cannot block
+the queue. Naming it with `--title` always tries it again.
+
 Several runs on one computer (different providers) are safe together: queue
 updates are serialised by a machine-wide lock, each article is locked while it
 is translated (a second process skips it), and a claim names its owner as

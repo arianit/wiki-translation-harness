@@ -113,3 +113,24 @@ async def test_queue_fresh_skips_backlog_and_stale_claims(tmp_path):
     # for an unclaimed line only (stale_hours=NEVER_STALE_HOURS), never a stale CLAIMED one.
     assert events == []
     assert queue.claim_next_pending.call_args.kwargs['stale_hours'] == runner.NEVER_STALE_HOURS
+
+
+def test_stuck_partials_are_skipped_after_max_attempts_unless_requested(tmp_path):
+    from wiki_translation_harness.resume import attempts_made, record_attempt
+
+    cfg = config(tmp_path)
+    stuck, other = ArticleInput('Stuck', source_lang='en'), ArticleInput('Other', source_lang='en')
+    for item in (stuck, other):
+        checkpoint_input(cfg, item)
+    for _ in range(cfg.max_resume_attempts - 1):
+        record_attempt(cfg, 'Stuck')
+    assert unfinished_inputs(cfg, []) == [other, stuck]  # one try left
+    assert record_attempt(cfg, 'Stuck') == cfg.max_resume_attempts
+    assert unfinished_inputs(cfg, []) == [other]
+    # an explicit request overrides the cap, as does a higher limit or 0 (unlimited)
+    assert stuck in unfinished_inputs(cfg, [stuck])
+    assert stuck in unfinished_inputs(cfg.model_copy(update={'max_resume_attempts': 4}), [])
+    assert stuck in unfinished_inputs(cfg.model_copy(update={'max_resume_attempts': 0}), [])
+    # finishing (discarding the partial) clears the counter
+    discard_partial_article(cfg.partial_output_dir, 'Stuck')
+    assert attempts_made(cfg, 'Stuck') == 0

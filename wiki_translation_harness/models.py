@@ -357,6 +357,11 @@ class Config(BaseModel):
     # article in flight, and makes multi-article runs easier to reason
     # about/resume. See run_pipeline()'s article-dispatch branch.
     sequential: bool = True
+    # How many times an unfinished article in partial_output/ is retried by
+    # implicit backlog pickup (queue mode, or a run that resumes unrelated
+    # drafts) before it is skipped as stuck. 0 = no limit. Articles named
+    # explicitly with --title are always attempted regardless.
+    max_resume_attempts: int = 3
     temperature: float = 0.0
     max_retries: int = 5
     cache: bool = True
