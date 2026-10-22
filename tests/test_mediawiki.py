@@ -138,3 +138,35 @@ async def test_parse_wikitext_times_out_instead_of_hanging():
         elapsed = time.monotonic() - start
         assert elapsed < 1.5, f"parse_wikitext should time out promptly, took {elapsed:.2f}s"
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_existing_templates_follows_redirects_and_marks_missing():
+    sq_api = "https://sq.wikipedia.org/w/api.php"
+    with respx.mock(base_url=sq_api) as mock:
+        mock.get(params={"action": "query"}).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "query": {
+                        "normalized": [{"from": "Template:infobox planet", "to": "Template:Infobox planet"}],
+                        "redirects": [{"from": "Template:Infobox old", "to": "Template:Infobox new"}],
+                        "pages": [
+                            {"title": "Template:Infobox planet"},
+                            {"title": "Template:Infobox new"},
+                            {"title": "Template:Nope", "missing": True},
+                        ],
+                    }
+                },
+            )
+        )
+        client = MediaWikiClient(sq_api, "test-agent/1.0")
+        try:
+            found = await client.existing_templates(["infobox planet", "Infobox old", "Nope"])
+        finally:
+            await client.aclose()
+    assert found == {
+        "infobox planet": "Template:Infobox planet",
+        "Infobox old": "Template:Infobox new",
+        "Nope": None,
+    }

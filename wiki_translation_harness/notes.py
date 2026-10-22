@@ -150,3 +150,29 @@ def expand_cref_notes(wikitext: str) -> NoteExpansionResult:
         unresolved=unresolved,
         unreferenced=[label for label in notes if label not in used],
     )
+
+
+_NOTE_TEMPLATE_RE = re.compile(r"\{\{\s*(notelist|listë shënimesh|efn)\s*[|}]", re.IGNORECASE)
+
+
+def _note_template_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for match in _NOTE_TEMPLATE_RE.finditer(text):
+        # sqwiki redirects Notelist to Listë shënimesh.
+        name = match.group(1).lower().replace("notelist", "listë shënimesh")
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def lost_note_templates(before: str, after: str) -> list[str]:
+    """Names of the {{Efn}}/{{Listë shënimesh}} templates (sqwiki's
+    {{notelist}}) that `after` has fewer of than `before`.
+
+    A repair call asked to fix some unrelated finding in a chunk can rewrite
+    its footnote machinery instead: on Mars the Notes chunk's
+    {{Listë shënimesh|notes={{Efn|name=...|...}}}} came back as a bare
+    <ref group="caption">, leaving every {{Efn}} in the infobox without text
+    and the lower-alpha group without a list (a live Cite error). Such a
+    repair is worse than none, so repair_chunk throws it away."""
+    kept = _note_template_counts(after)
+    return [name for name, count in _note_template_counts(before).items() if kept.get(name, 0) < count]

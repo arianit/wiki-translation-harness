@@ -34,6 +34,17 @@ def test_legacy_snapshots_prioritize_requested_identity_and_skip_completed(tmp_p
     assert unfinished_inputs(cfg, [local]) == [local, ArticleInput('Old article', source_lang=cfg.source_lang)]
 
 
+def test_requested_only_resume_ignores_unrelated_partial_articles(tmp_path):
+    cfg = config(tmp_path)
+    cfg.partial_output_dir.mkdir()
+    for name in ['Requested', 'Unrelated']:
+        (cfg.partial_output_dir / f'{name}.wiki').write_text('partial')
+
+    assert unfinished_inputs(cfg, [ArticleInput('Requested')], requested_only=True) == [
+        ArticleInput('Requested')
+    ]
+
+
 @pytest.mark.asyncio
 async def test_pipeline_awaits_backlog_before_loading_new_work(tmp_path):
     import wiki_translation_harness.pipeline as pipeline
@@ -80,3 +91,25 @@ async def test_queue_retries_backlog_before_claim_and_counts_it_toward_limit(tmp
         await runner.run_queue_mode(cfg, max_articles=1)
     assert events == ['retry']
     queue.claim_next_pending.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queue_fresh_skips_backlog_and_stale_claims(tmp_path):
+    import wiki_translation_harness.pipeline as pipeline
+    import wiki_translation_harness.queue_runner as runner
+    cfg = config(tmp_path)
+    checkpoint_input(cfg, ArticleInput('Old', source_lang='en'))
+    from unittest.mock import Mock
+    queue = Mock()
+    queue.claim_next_pending.return_value = None
+    events = []
+
+    async def retry(config, inputs, **kwargs):
+        events.append('retry')
+
+    with patch.object(runner, 'load_queue_lib', return_value=queue), patch.object(pipeline, 'run_pipeline', side_effect=retry):
+        await runner.run_queue_mode(cfg, max_articles=1, fresh=True)
+    # The unfinished local draft is left untouched, and the queue is asked
+    # for an unclaimed line only (stale_hours=NEVER_STALE_HOURS), never a stale CLAIMED one.
+    assert events == []
+    assert queue.claim_next_pending.call_args.kwargs['stale_hours'] == runner.NEVER_STALE_HOURS

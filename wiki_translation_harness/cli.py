@@ -101,8 +101,10 @@ def _build_overrides(
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    title: Optional[str] = typer.Option(
-        None, "--title", help="Article title, optionally `lang:Title` or a full Wikipedia URL"
+    title: Optional[list[str]] = typer.Option(
+        None,
+        "--title",
+        help="Article title; repeat for multiple articles. May be `lang:Title` or a full Wikipedia URL",
     ),
     titles: Optional[Path] = typer.Option(
         None, "--titles", help="Text file, one title per line (each may carry its own `lang:Title` prefix)"
@@ -185,8 +187,23 @@ def main(
     resume: bool = typer.Option(
         True,
         "--resume/--no-resume",
-        help="Before the requested articles, retry every unfinished article left in partial_output/ "
-        "(default). --no-resume runs only what was asked for.",
+        help="Resume unfinished requested articles (default). --no-resume starts only new work; "
+        "unrelated partial articles are never picked up by an explicit title/category run.",
+    ),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Start fresh: do not pick up drafts another agent left in partial_output/ "
+        "(equivalent to --no-resume here). Kept as an explicit switch matching `queue --fresh`.",
+    ),
+    mark: bool = typer.Option(
+        True,
+        "--mark/--no-mark",
+        help="Record each requested article's result (DONE/FAILED and the engine) on its shared-queue "
+        "line, if it has one, and push it. A failure never downgrades a DONE line or takes a pending one.",
+    ),
+    queue_repo_dir: Path = typer.Option(
+        DEFAULT_QUEUE_REPO_DIR, "--queue-repo-dir", help="Local clone of github.com/arianit/wiki-translate-queue"
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
@@ -219,7 +236,7 @@ def main(
 
     logger = setup_logging(cfg.log_dir)
 
-    async def _run() -> StatsTracker:
+    async def _run() -> tuple[StatsTracker, list[ArticleInput]]:
         from wiki_translation_harness.pipeline import run_pipeline  # local import: avoids import cost on --help
 
         inputs: list[ArticleInput] = resolve_static_inputs(title, titles, file, directory)
@@ -251,11 +268,12 @@ def main(
         with ProgressReporter(stats_tracker.stats, cfg.workers, console=console) as reporter:
             result = await run_pipeline(
                 cfg, inputs, force=force, reporter=reporter, stats_tracker=stats_tracker,
-                resume_unfinished=resume,
+                resume_unfinished=resume and not fresh,
+                resume_requested_only=True,
             )
-        return result
+        return result, inputs
 
-    stats_tracker = asyncio.run(_run())
+    stats_tracker, inputs = asyncio.run(_run())
     stats = stats_tracker.stats
     console.print(
         f"\nDone. Articles completed: {stats.articles_completed}, failed: {stats.articles_failed}, "
@@ -263,6 +281,39 @@ def main(
         f"Stats written to {cfg.stats_path}"
     )
     _print_model_usage(stats)
+    if mark:
+        _mark_queue_results(cfg, stats_tracker, inputs, queue_repo_dir)
+
+
+def _mark_queue_results(cfg, stats_tracker: StatsTracker, inputs: list[ArticleInput], queue_repo_dir: Path) -> None:
+    """Mirror `queue` mode for a manual run: record DONE/FAILED (plus the
+    engine) on the requested articles' queue lines. Local --file/--directory
+    inputs have no queue line, and a queue problem never fails the run."""
+    from wiki_translation_harness.queue_runner import _status_with_engine, mark_title_results
+
+    results = stats_tracker.stats.article_results
+    outcomes = [
+        (item.source_lang, item.title, results[item.title] == "completed")
+        for item in inputs
+        if item.local_path is None and item.title in results
+    ]
+    if not outcomes:
+        return
+    if not (queue_repo_dir / "queue_lib.py").exists():
+        console.print(f"[yellow]Queue not updated: no queue clone at {queue_repo_dir}[/yellow]")
+        return
+    try:
+        updated = mark_title_results(
+            queue_repo_dir, outcomes,
+            done_status=_status_with_engine("DONE", stats_tracker, cfg),
+            failed_status=_status_with_engine("FAILED", stats_tracker, cfg),
+            default_lang=cfg.source_lang,
+        )
+    except Exception as exc:  # noqa: BLE001 - the translation itself already succeeded or failed on its own
+        console.print(f"[red]Could not update the queue: {exc}[/red]")
+        return
+    for url in updated:
+        console.print(f"Queue updated: {url}")
 
 
 @app.command()
@@ -383,6 +434,12 @@ def queue(
     validate: Optional[bool] = typer.Option(None, "--validate/--no-validate"),
     repair: Optional[bool] = typer.Option(None, "--repair/--no-repair"),
     live_validate: Optional[bool] = typer.Option(None, "--live-validate/--no-live-validate"),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Start only articles no agent has started: skip the local partial_output/ backlog and "
+        "never reclaim stale CLAIMED queue lines left by another worker; claim only lines with no status.",
+    ),
     config_path: Path = typer.Option(Path("config.yaml"), "--config", help="Path to config.yaml"),
 ) -> None:
     """Drain articles from the shared queue (github.com/arianit/wiki-translate-queue)
@@ -423,7 +480,7 @@ def queue(
     start = datetime.now()
     console.print(f"Queue run started at {start:%Y-%m-%d %H:%M:%S}")
     stats_tracker = asyncio.run(
-        run_queue_mode(cfg, queue_repo_dir=queue_repo_dir, max_articles=max_articles, stale_hours=stale_hours)
+        run_queue_mode(cfg, queue_repo_dir=queue_repo_dir, max_articles=max_articles, stale_hours=stale_hours, fresh=fresh)
     )
     end = datetime.now()
     stats = stats_tracker.stats

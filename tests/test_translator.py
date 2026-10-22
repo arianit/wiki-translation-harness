@@ -328,3 +328,23 @@ def test_dropped_infobox_detected_and_restored_after_leading_templates():
     assert restored.index(box) < restored.index("[[File:A.png")
     assert dropped_infoboxes(source, restored) == []
     assert restore_dropped_infoboxes(source, kept) == (kept, 0)
+
+
+@pytest.mark.asyncio
+async def test_dropped_infobox_is_translated_on_its_own():
+    source = "{{Short description|Planet}}\n{{Infobox planet\n| name = Mars\n| caption = A red planet\n}}\n'''Mars''' is a planet.\n"
+    chunk = Chunk(
+        article_title="Mars", section_titles=["Lead"], order=0, text=source,
+        token_estimate=40, source_lang="en",
+    )
+    client = FakeOpenRouterClient([
+        "{{Short description|Planeti}}\n'''Marsi''' është planet.\n",
+        "{{Infobox planet\n| name = Marsi\n| caption = Një planet i kuq\n}}",
+    ])
+    outcome = await translate_chunk(chunk, _config(), client, _skill(), None, None, RunStats())
+    assert len(client.calls) == 2
+    assert "BEGIN SOURCE WIKITEXT ---\n{{Infobox planet" in client.calls[1][-1]["content"]
+    assert "Një planet i kuq" in chunk.translated_text
+    assert chunk.translated_text.index("Infobox planet") < chunk.translated_text.index("'''Marsi'''")
+    assert "A red planet" not in chunk.translated_text
+    assert outcome.validation.valid

@@ -76,6 +76,7 @@ def keep_source_reference_block(source_text: str, translated_text: str) -> str:
 logger = logging.getLogger(__name__)
 
 _INFOBOX_PREFIXES = ("infobox", "kuti")
+_INFOBOX_ATTEMPTS = 3
 
 
 def _top_level_infoboxes(text: str) -> list[str]:
@@ -99,14 +100,10 @@ def dropped_infoboxes(source_text: str, translated_text: str) -> list[str]:
     return source_boxes[len(_top_level_infoboxes(translated_text)):]
 
 
-def restore_dropped_infoboxes(source_text: str, translated_text: str) -> tuple[str, int]:
-    """Put the source's lost infoboxes back, verbatim (parameter names stay
-    English, which sqwiki wants; values are left for review), after the
-    translation's leading templates — where the source keeps them too.
-    Returns (patched_text, restored_count)."""
-    missing = dropped_infoboxes(source_text, translated_text)
-    if not missing:
-        return translated_text, 0
+def insert_infoboxes(translated_text: str, boxes: list[str]) -> str:
+    """Insert infoboxes after the translation's leading templates (short
+    description, hatnotes, maintenance banners) — where the source keeps
+    them too."""
     pos = offset = 0
     for node in mwp.parse(translated_text).nodes:
         text = str(node)
@@ -115,7 +112,16 @@ def restore_dropped_infoboxes(source_text: str, translated_text: str) -> tuple[s
             pos = offset
         elif not (isinstance(node, mwp.nodes.Text) and not text.strip()):
             break
-    return translated_text[:pos] + "\n" + "\n".join(missing) + translated_text[pos:], len(missing)
+    return translated_text[:pos] + "\n" + "\n".join(boxes) + translated_text[pos:]
+
+
+def restore_dropped_infoboxes(source_text: str, translated_text: str) -> tuple[str, int]:
+    """Last resort: put the source's lost infoboxes back verbatim (still
+    English). Returns (patched_text, restored_count)."""
+    missing = dropped_infoboxes(source_text, translated_text)
+    if not missing:
+        return translated_text, 0
+    return insert_infoboxes(translated_text, missing), len(missing)
 
 
 @dataclass
@@ -196,21 +202,39 @@ async def translate_chunk(
         total_completion_tokens = result.completion_tokens
         total_latency = result.latency_s
         translated_text = result.text
-        if dropped_infoboxes(chunk.text, translated_text):
+        missing_infoboxes = dropped_infoboxes(chunk.text, translated_text)
+        if missing_infoboxes:
+            # The model skipped it inside a long chunk; asked about the
+            # infobox alone it rarely does, and the rest of the chunk is
+            # already translated.
             logger.warning(
-                "Translation of %r chunk %d dropped the source infobox; retrying once",
-                chunk.article_title, chunk.order,
+                "Translation of %r chunk %d dropped %d source infobox(es); translating them on their own",
+                chunk.article_title, chunk.order, len(missing_infoboxes),
             )
-            result = await run_completion(effective_client, effective_model, messages, config.temperature, effective_pricing, on_retry=on_retry)
-            stats.record_usage(effective_model, result)
-            total_prompt_tokens += result.prompt_tokens
-            total_completion_tokens += result.completion_tokens
-            total_latency += result.latency_s
-            translated_text = result.text
-            translated_text, restored = restore_dropped_infoboxes(chunk.text, translated_text)
-            if restored:
+            translated_boxes: list[str] = []
+            for box in missing_infoboxes:
+                box_messages = build_translation_messages(
+                    skill, chunk.source_lang, config.target_lang, chunk.article_title,
+                    "Infobox", box, verified_facts_block=facts_block,
+                )
+                for box_attempt in range(1, _INFOBOX_ATTEMPTS + 1):
+                    box_result = await run_completion(effective_client, effective_model, box_messages, config.temperature, effective_pricing, on_retry=on_retry)
+                    stats.record_usage(effective_model, box_result)
+                    total_prompt_tokens += box_result.prompt_tokens
+                    total_completion_tokens += box_result.completion_tokens
+                    total_latency += box_result.latency_s
+                    if len(_top_level_infoboxes(box_result.text)) == 1:
+                        translated_boxes.append(box_result.text.strip())
+                        break
+                    logger.warning(
+                        "Infobox-only translation of %r chunk %d (attempt %d/%d) has no infobox; starts: %r",
+                        chunk.article_title, chunk.order, box_attempt, _INFOBOX_ATTEMPTS, box_result.text[:200],
+                    )
+            translated_text = insert_infoboxes(translated_text, translated_boxes)
+            if dropped_infoboxes(chunk.text, translated_text):
+                translated_text, restored = restore_dropped_infoboxes(chunk.text, translated_text)
                 logger.warning(
-                    "Restored %d source infobox(es) verbatim into %r chunk %d after a second drop",
+                    "Restored %d source infobox(es) untranslated into %r chunk %d: the model dropped them again",
                     restored, chunk.article_title, chunk.order,
                 )
     translated_text = keep_source_reference_block(chunk.text, translated_text)

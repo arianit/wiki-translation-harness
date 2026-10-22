@@ -58,7 +58,7 @@ def parse_source_ref(raw: str) -> tuple[str | None, str]:
 
 
 def resolve_static_inputs(
-    title: str | None,
+    title: str | list[str] | None,
     titles_file: Path | None,
     file: Path | None,
     directory: Path | None,
@@ -66,8 +66,10 @@ def resolve_static_inputs(
     inputs: list[ArticleInput] = []
 
     if title:
-        lang, parsed_title = parse_source_ref(title)
-        inputs.append(ArticleInput(title=parsed_title, source_lang=lang))
+        titles = [title] if isinstance(title, str) else title
+        for raw_title in titles:
+            lang, parsed_title = parse_source_ref(raw_title)
+            inputs.append(ArticleInput(title=parsed_title, source_lang=lang))
 
     if titles_file:
         for line in titles_file.read_text(encoding="utf-8").splitlines():

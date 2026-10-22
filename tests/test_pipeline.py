@@ -20,11 +20,13 @@ import pytest
 from wiki_translation_harness.cache import TranslationCache, compute_key
 from wiki_translation_harness.models import Chunk, Config, RunStats
 from wiki_translation_harness.pipeline import (
+    collapse_duplicate_list_defined_refs,
     drop_stray_reference_lists,
     extend_references_block_over_trailing_defs,
     merge_split_references_blocks,
     restore_orphaned_ref_definitions,
     restore_ref_group_names,
+    restore_ref_names,
     run_assembly_repair,
     run_review_pass,
 )
@@ -553,6 +555,53 @@ def test_extend_references_block_leaves_prose_after_block_alone():
     assert extend_references_block_over_trailing_defs(text) == (text, 0)
 
 
+def test_restore_ref_names_undoes_collapsed_names_from_cluj_napoca():
+    # Seven different Brubaker citations ended up under one invented name.
+    source = (
+        'A.<ref>Brubaker et al. 2006, p.xxi</ref> B.<ref name="Brubaker et al">Brubaker et al. 2006, p.91</ref>'
+        ' C.<ref>Brubaker et al. 2006, p.92</ref><ref name="Brubaker et al" />\n'
+    )
+    text = (
+        'A.<ref name="Brubaker et-4">Brubaker et al. 2006, p.xxi</ref>'
+        ' B.<ref name="Brubaker et-4">Brubaker et al. 2006, f. 91</ref>'
+        ' C.<ref name="Brubaker et-4">Brubaker et al. 2006, f. 92</ref><ref name="Brubaker et-4" />\n'
+    )
+    patched, changes = restore_ref_names(text, source)
+    assert patched == (
+        'A.<ref>Brubaker et al. 2006, p.xxi</ref>'
+        ' B.<ref name="Brubaker et al">Brubaker et al. 2006, f. 91</ref>'
+        ' C.<ref>Brubaker et al. 2006, f. 92</ref><ref name="Brubaker et al" />\n'
+    )
+    assert changes == {"Brubaker et-4": [None, "Brubaker et al", None, "Brubaker et al"]}
+
+
+def test_restore_ref_names_restores_a_consistent_rename_with_a_url_match():
+    source = '<ref name="Nicula">András et al. 2003, p.142 http://x.ro/a</ref><ref name="Nicula"/>'
+    text = "<ref name='Nicula-1'>András et al. 2003, f.142 http://x.ro/a</ref><ref name=Nicula-1 />"
+    patched, changes = restore_ref_names(text, source)
+    assert patched == (
+        '<ref name="Nicula">András et al. 2003, f.142 http://x.ro/a</ref><ref name="Nicula" />'
+    )
+    assert changes == {"Nicula-1": ["Nicula", "Nicula"]}
+
+
+def test_restore_ref_names_leaves_source_names_and_unmatched_refs_alone():
+    source = '<ref name="A">a 2001</ref><ref>b 2002</ref><ref>c 2002</ref>'
+    # "A" is a source name, "X" matches no source ref, and "Y" matches
+    # unnamed source refs only, so its definition loses the name; the bodyless
+    # reuse has no named target to follow and stays put.
+    text = '<ref name="A">a 2001</ref><ref name="X">z 1999</ref><ref name="Y">b 2002</ref><ref name="Y" />'
+    patched, changes = restore_ref_names(text, source)
+    assert patched == '<ref name="A">a 2001</ref><ref name="X">z 1999</ref><ref>b 2002</ref><ref name="Y" />'
+    assert changes == {"Y": [None]}
+
+
+def test_restore_ref_names_ignores_refs_without_urls_or_numbers():
+    source = "<ref>Anonim</ref><ref name=\"S\">Tjetër</ref>"
+    text = '<ref name="Z">Anonim</ref>'
+    assert restore_ref_names(text, source) == (text, {})
+
+
 def test_restore_orphaned_ref_definitions_copies_dropped_definition_from_source():
     # Translation condensed away the sentence carrying the definition but
     # kept the later reuse — the Soviet Union "Hanson" case.
@@ -708,3 +757,33 @@ async def test_missing_unlocated_module_retains_error_without_model_calls():
     )
     assert issues
     assert not client.calls
+
+
+def test_collapse_duplicate_list_defined_refs_keeps_the_blocks_copy():
+    source = (
+        'Text.<ref name="a" /> More.<ref name="b" /> Own.<ref name="c">Body only.</ref>\n'
+        '<references>\n<ref name="a">Source A</ref>\n<ref name="b">Source B</ref>\n</references>\n'
+    )
+    text = (
+        'Tekst.<ref name="a">Rewritten A</ref> Më.<ref name="b" /> Vet.<ref name="c">Body only.</ref>'
+        ' Grup.<ref name="a" group="note">Noted</ref>\n'
+        '<references>\n<ref name="a">Source A</ref>\n<ref name="b">Source B</ref>\n</references>\n'
+    )
+    patched, collapsed = collapse_duplicate_list_defined_refs(text, source)
+    assert collapsed == ["a"]
+    assert patched.startswith('Tekst.<ref name="a" /> Më.<ref name="b" /> Vet.<ref name="c">Body only.</ref>')
+    assert '<ref name="a" group="note">Noted</ref>' in patched
+    assert patched.count('<ref name="a">Source A</ref>') == 1
+    assert collapse_duplicate_list_defined_refs(patched, source) == (patched, [])
+
+
+@pytest.mark.asyncio
+async def test_repair_chunk_discards_a_repair_that_drops_the_notelist():
+    from wiki_translation_harness.repair import repair_chunk
+
+    chunk = "== Shënime ==\n{{Listë shënimesh|notes=\n{{Efn|name=x|Shënim}}\n}}\n"
+    client = FakeOpenRouterClient(['== Shënime ==\n<ref group="caption">Shënim</ref>\n'])
+    result = await repair_chunk(
+        client, _skill(), "test-model", 0.0, "en", "sq", "Mars", "Notes", chunk, ["error: whatever"], None
+    )
+    assert result.text == chunk

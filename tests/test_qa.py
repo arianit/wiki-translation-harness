@@ -42,6 +42,9 @@ def test_broken_templates_and_image_option():
         ("{{Native name|ar|x}}", "qa_broken_native_name"),
         ("{{cite tweet|user=a|number=1}}", "qa_cite_tweet"),
         ("[[Skeda:X.jpg|miniaturë|caption]]", "qa_miniature_option"),
+        ("[[File:X.jpg|miniatura|caption]]", "qa_miniature_option"),
+        ("[[File:X.jpg|mini|caption]]", "qa_miniature_option"),
+        ("[[File:X.jpg|sinistra|miniatura|caption]]", "qa_miniature_option"),
         ("{{Shih edhe|Foo}}", "qa_shih_edhe_template"),
         ("{{Kryesor|[[Foo]]}}", "qa_hatnote_wrapped_param"),
     ]:

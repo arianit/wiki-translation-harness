@@ -194,6 +194,10 @@ class RunStats(BaseModel):
     # had unresolved defects after the assembly-level repair loop, rather
     # than one that crashed/timed out. See review_queue.py.
     articles_needs_human_review: int = 0
+    # Source title -> "completed" | "failed" | "needs_human_review" for every
+    # article this run decided. Lets the CLI record each outcome on the
+    # shared queue (see queue_runner.mark_title_results).
+    article_results: dict[str, str] = Field(default_factory=dict)
     sections_translated: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
@@ -345,7 +349,7 @@ class Config(BaseModel):
     # since a fidelity concern is a human spot-check prompt, not a publish
     # blocker the way an unresolved structural defect is.
     review_max_repair_attempts: int = 2
-    workers: int = 2
+    workers: int = 4
     # Process articles one at a time (still using up to `workers` concurrent
     # chunk translations within each article) instead of starting every
     # requested article's chunks concurrently. Bounds the blast radius of a

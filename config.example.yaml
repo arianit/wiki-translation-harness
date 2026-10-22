@@ -34,7 +34,7 @@ provider: codex
 # fallback_model: gpt-6-luna
 # fallback_auto_switch: true
 # No `model:` here either, for the same reason -- let it auto-derive.
-workers: 2
+workers: 4
 sequential: true
 temperature: 0
 max_retries: 5

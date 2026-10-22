@@ -14,6 +14,7 @@ the harness's own, growing equivalent of the skill's sqwiki-verified.md.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass, field
 
@@ -23,6 +24,8 @@ import mwparserfromhell as mwp
 from wiki_translation_harness.cache import VerificationCache
 from wiki_translation_harness.citation_language import CITATION_TEMPLATE_NAMES
 from wiki_translation_harness.mediawiki import MediaWikiClient, MediaWikiError
+
+logger = logging.getLogger(__name__)
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 _INFOBOX_NAME_RE = re.compile(r"^infobox\b", re.IGNORECASE)
@@ -421,6 +424,18 @@ async def verify_wikitext(
     templates = await _resolve_cached_then_live(
         template_names, "template", source_lang, target_lang, cache, verifier.check_template_sitelinks
     )
+    # Wikidata only knows a template when its item has a sitelink to the
+    # target wiki, but sqwiki carries many English-named templates (Stampa:
+    # Infobox planet) without one. Told "NOT FOUND", the model drops or
+    # rebuilds them as tables, so ask the target wiki itself.
+    unresolved_templates = [name for name, target in templates.items() if target is None]
+    if unresolved_templates and target_mw_client is not None:
+        try:
+            on_target = await target_mw_client.existing_templates(unresolved_templates)
+        except Exception as exc:
+            logger.warning("Target-wiki template lookup failed for %r: %s", article_title, exc)
+            on_target = {}
+        templates.update({name: target for name, target in on_target.items() if target})
     existing_target_title, sibling_links = await _check_existing_article(
         article_title, source_lang, target_lang, verifier, target_mw_client, cache
     )

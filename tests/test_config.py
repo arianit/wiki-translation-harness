@@ -22,7 +22,7 @@ def test_default_provider_and_workers():
     cfg = build_config(None, _CONTACT)
     assert cfg.provider == "claude_code"
     assert cfg.model == "claude-sonnet-5-5"
-    assert cfg.workers == 2
+    assert cfg.workers == 4
 
 
 def test_switching_to_openrouter_without_model_gets_openrouter_default(monkeypatch):

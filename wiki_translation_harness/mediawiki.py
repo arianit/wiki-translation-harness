@@ -132,6 +132,36 @@ class MediaWikiClient:
 
         return titles
 
+    async def existing_templates(self, names: list[str]) -> dict[str, str | None]:
+        """Bare template name -> its full title on this wiki ("Stampa:Infobox
+        planet"), following redirects, or None when no such template exists.
+        Asks for "Template:<name>", which every wiki accepts as the canonical
+        namespace name."""
+        results: dict[str, str | None] = {}
+        for start in range(0, len(names), 50):
+            batch = names[start : start + 50]
+            params = {
+                "action": "query",
+                "titles": "|".join(f"Template:{name}" for name in batch),
+                "redirects": "1",
+                "format": "json",
+                "formatversion": "2",
+            }
+            resp = await asyncio.wait_for(
+                self._client.get(self.api_url, params=params), timeout=self._hard_timeout
+            )
+            resp.raise_for_status()
+            query = resp.json().get("query", {})
+            normalized = {m["from"]: m["to"] for m in query.get("normalized", [])}
+            redirects = {m["from"]: m["to"] for m in query.get("redirects", [])}
+            pages = {page["title"]: not page.get("missing", False) for page in query.get("pages", [])}
+            for name in batch:
+                title = f"Template:{name}"
+                title = normalized.get(title, title)
+                title = redirects.get(title, title)
+                results[name] = title if pages.get(title) else None
+        return results
+
     async def parse_wikitext(self, text: str, title: str = "API") -> dict:
         """Live-render wikitext via action=parse, for post-translation
         validation only (Lua/cite errors, missing templates, redlinks) —

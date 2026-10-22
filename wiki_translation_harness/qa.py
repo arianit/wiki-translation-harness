@@ -78,8 +78,8 @@ _PATTERN_CHECKS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "qa_miniature_option",
-        re.compile(r"\|miniaturë\|"),
-        "'miniaturë' is not an image option alias on sqwiki and silently drops the thumbnail frame; use |thumb|",
+        re.compile(r"\|(?:miniaturë|miniatura|mini|sinistra)(?=\||\]\])"),
+        "'miniaturë'/'miniatura'/'mini'/'sinistra' are not image option aliases on sqwiki and silently drop the thumbnail frame or alignment; use |thumb| and |left|",
     ),
 ]
 

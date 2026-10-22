@@ -22,16 +22,21 @@ def checkpoint_input(config: Config, item: ArticleInput) -> None:
     tmp.replace(path)
 
 
-def unfinished_inputs(config: Config, requested: list[ArticleInput]) -> list[ArticleInput]:
+def unfinished_inputs(
+    config: Config, requested: list[ArticleInput], *, requested_only: bool = False
+) -> list[ArticleInput]:
     """Old snapshots lack metadata; prefer a matching requested input, then
     infer the source title from the filename using the configured language.
     Invalid metadata raises rather than silently bypassing unfinished work.
     """
     by_name = {output_path_for(config.partial_output_dir, i.title).stem: i for i in requested}
+    requested_names = set(by_name)
     found: list[ArticleInput] = []
     names = {p.stem for p in config.partial_output_dir.glob('*.wiki')}
     names.update(p.name.removesuffix('.resume.json') for p in config.partial_output_dir.glob('*.resume.json'))
     for name in sorted(names):
+        if requested_only and name not in requested_names:
+            continue
         metadata = config.partial_output_dir / f'{name}.resume.json'
         if metadata.exists():
             data = json.loads(metadata.read_text(encoding='utf-8'))

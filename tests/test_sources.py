@@ -45,3 +45,17 @@ def test_resolve_static_inputs_mixed_titles_file(tmp_path: Path):
     ]
 
 
+def test_resolve_static_inputs_repeated_titles():
+    inputs = resolve_static_inputs(
+        title=["Paris", "sq:Gjergj Arianiti", "https://sr.wikipedia.org/wiki/%D0%9D%D0%B8%D1%88"],
+        titles_file=None,
+        file=None,
+        directory=None,
+    )
+    assert [(i.title, i.source_lang) for i in inputs] == [
+        ("Paris", None),
+        ("Gjergj Arianiti", "sq"),
+        ("Ниш", "sr"),
+    ]
+
+

@@ -12,14 +12,19 @@ about wording (skill_loader._SEMANTIC_REPAIR_FRAME).
 
 from __future__ import annotations
 
+import logging
+
 from wiki_translation_harness.engines import LLMEngineClient
 from wiki_translation_harness.models import ModelPricing, TranslationResult
+from wiki_translation_harness.notes import lost_note_templates
 from wiki_translation_harness.openrouter import RetryCallback, run_completion
 from wiki_translation_harness.skill_loader import (
     SkillContent,
     build_repair_messages,
     build_semantic_repair_messages,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def repair_chunk(
@@ -40,7 +45,8 @@ async def repair_chunk(
     messages = build_repair_messages(
         skill, source_lang, target_lang, article_title, section_title, invalid_text, errors, qa_skill=qa_skill
     )
-    return await run_completion(client, model, messages, temperature, pricing, on_retry=on_retry)
+    result = await run_completion(client, model, messages, temperature, pricing, on_retry=on_retry)
+    return _discard_if_notes_lost(result, invalid_text, article_title, section_title)
 
 
 async def repair_chunk_semantic(
@@ -72,5 +78,18 @@ async def repair_chunk_semantic(
         structural_errors=structural_errors,
         qa_skill=qa_skill,
     )
-    return await run_completion(client, model, messages, temperature, pricing, on_retry=on_retry)
+    result = await run_completion(client, model, messages, temperature, pricing, on_retry=on_retry)
+    return _discard_if_notes_lost(result, translated_text, article_title, section_title)
 
+
+def _discard_if_notes_lost(
+    result: TranslationResult, before: str, article_title: str, section_title: str
+) -> TranslationResult:
+    lost = lost_note_templates(before, result.text)
+    if lost:
+        logger.warning(
+            "Discarded a repair of %r / %r: it removed footnote template(s) %s the chunk had",
+            article_title, section_title, lost,
+        )
+        return result.model_copy(update={"text": before})
+    return result

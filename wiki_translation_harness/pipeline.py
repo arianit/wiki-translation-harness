@@ -50,11 +50,13 @@ from wiki_translation_harness.models import (
     ValidationIssue,
 )
 from wiki_translation_harness.openrouter import RetryCallback
+from wiki_translation_harness.locks import release as release_lock, try_lock_article
 from wiki_translation_harness.output import (
     article_already_done,
     assemble_chunks,
     assemble_chunks_with_spans,
     discard_partial_article,
+    output_path_for,
     save_article,
     save_partial_article,
 )
@@ -392,6 +394,69 @@ def _ref_name(match: re.Match[str]) -> str:
     return (match.group(1) or match.group(2) or match.group(3)).strip()
 
 
+_REFERENCES_BLOCK_RE = re.compile(r"<references\b[^>/]*>(.*?)</references\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _block_spans(text: str) -> list[tuple[int, int]]:
+    return [m.span() for m in _REFERENCES_BLOCK_RE.finditer(text)]
+
+
+def collapse_duplicate_list_defined_refs(text: str, source_text: str) -> tuple[str, list[str]]:
+    """Turn a body definition of a list-defined ref back into a plain reuse.
+
+    The source keeps these refs' text only inside the `<references>` block;
+    in the body they are `<ref name="x" />`. A chunk whose model "helpfully"
+    writes the full text at the first use (or whose definition
+    restore_orphaned_ref_definitions copied in from the source before the
+    block's own copy was in place) leaves two definitions — often worded
+    differently — and Cite reports the ref as defined multiple times with
+    different content. The block's copy wins: it is the source's.
+
+    Only names the source defines inside a block and nowhere else, and only
+    refs without a group. Returns (patched_text, collapsed_names)."""
+    def _names_in(block_texts: list[str]) -> set[str]:
+        return {_ref_name(m) for chunk in block_texts for m in _REF_DEFINITION_RE.finditer(chunk)}
+
+    source_blocks = _block_spans(source_text)
+    in_source_blocks = _names_in([source_text[a:b] for a, b in source_blocks])
+    source_outside = "".join(
+        source_text[start:end]
+        for start, end in _complement_spans(len(source_text), source_blocks)
+    )
+    list_defined = in_source_blocks - _names_in([source_outside])
+    blocks = _block_spans(text)
+    in_text_blocks = _names_in([text[a:b] for a, b in blocks])
+    targets = list_defined & in_text_blocks
+    if not targets:
+        return text, []
+
+    collapsed: list[str] = []
+    out: list[str] = []
+    for start, end in _complement_spans(len(text), blocks):
+        def _collapse(match: re.Match[str]) -> str:
+            name = _ref_name(match)
+            opening = match.group(0)[: match.group(0).index(">") + 1]
+            if name not in targets or re.search(r"\bgroup\s*=", opening, re.IGNORECASE):
+                return match.group(0)
+            collapsed.append(name)
+            return f'<ref name="{name}" />'
+
+        out.append((start, _REF_DEFINITION_RE.sub(_collapse, text[start:end])))
+    pieces = sorted(out + [(a, text[a:b]) for a, b in blocks])
+    return "".join(piece for _, piece in pieces), collapsed
+
+
+def _complement_spans(length: int, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    result, pos = [], 0
+    for start, end in sorted(spans):
+        if start > pos:
+            result.append((pos, start))
+        pos = end
+    if pos < length:
+        result.append((pos, length))
+    return result
+
+
 def restore_orphaned_ref_definitions(text: str, source_text: str) -> tuple[str, list[str]]:
     """Copy back named-ref definitions that translation dropped.
 
@@ -423,6 +488,94 @@ def restore_orphaned_ref_definitions(text: str, source_text: str) -> tuple[str, 
         return f'<ref name="{name}">{source_defs[name]}</ref>'
 
     return _REF_SELF_CLOSING_RE.sub(_restore, text), restored
+
+
+_REF_TAG_RE = re.compile(
+    r"<ref\b(?P<attrs>[^>]*?)(?:/>|(?<!/)>(?P<body>(?:(?!<ref\b).)*?)</ref\s*>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_REF_NAME_ATTR_RE = re.compile(_REF_NAME_ATTR.replace(r"\bname", r"\s*\bname", 1), re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s|}\]<]+")
+
+
+def _ref_fingerprint(body: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """URLs and digit runs of a ref body: what survives translation of a
+    citation (titles and month names change, addresses and numbers don't)."""
+    return tuple(_URL_RE.findall(body)), tuple(re.findall(r"\d+", _URL_RE.sub("", body)))
+
+
+def restore_ref_names(text: str, source_text: str) -> tuple[str, dict[str, list[str | None]]]:
+    """Undo the model renaming refs (`Brubaker et al-4` -> `Brubaker et-4`).
+
+    A ref name is an identifier, never prose, but the model sometimes
+    rewrites it, or names a ref the source left unnamed — and once several
+    different citations share one invented name Cite reports it as defined
+    multiple times with different content (Cluj-Napoca: seven Brubaker
+    citations under one name).
+
+    Only names the source never uses are touched. Each definition under such
+    a name is matched to the source definition with the same URLs and
+    numbers; it takes that definition's name, or loses its name when the
+    source ref was unnamed. A definition with no unambiguous match is left
+    alone. Reuses of the name follow only when its matched definitions
+    agree on exactly one source name.
+
+    Returns (patched_text, {translated_name: [restored names; None = unnamed]})."""
+    source_tags = list(_REF_TAG_RE.finditer(source_text))
+    source_names: set[str] = set()
+    by_fingerprint: dict[tuple, list[str | None]] = {}
+    for tag in source_tags:
+        name_match = _REF_NAME_ATTR_RE.search(tag.group("attrs"))
+        name = _ref_name(name_match) if name_match else None
+        if name:
+            source_names.add(name)
+        if tag.group("body") is not None:
+            by_fingerprint.setdefault(_ref_fingerprint(tag.group("body")), []).append(name)
+
+    tags = list(_REF_TAG_RE.finditer(text))
+    definition_targets: dict[int, str | None] = {}
+    named_targets: dict[str, set[str]] = {}
+    for index, tag in enumerate(tags):
+        name_match = _REF_NAME_ATTR_RE.search(tag.group("attrs"))
+        if not name_match or tag.group("body") is None:
+            continue
+        name = _ref_name(name_match)
+        if name in source_names:
+            continue
+        fingerprint = _ref_fingerprint(tag.group("body"))
+        candidates = by_fingerprint.get(fingerprint, []) if any(fingerprint) else []
+        if not candidates or len(set(candidates)) != 1:
+            continue
+        definition_targets[index] = candidates[0]
+        if candidates[0] is not None:
+            named_targets.setdefault(name, set()).add(candidates[0])
+
+    changes: dict[str, list[str | None]] = {}
+    edits: list[tuple[int, int, str]] = []
+    for index, tag in enumerate(tags):
+        name_match = _REF_NAME_ATTR_RE.search(tag.group("attrs"))
+        if not name_match:
+            continue
+        name = _ref_name(name_match)
+        if name in source_names:
+            continue
+        if tag.group("body") is not None:
+            if index not in definition_targets:
+                continue
+            target = definition_targets[index]
+        else:
+            targets = named_targets.get(name, set())
+            if len(targets) != 1:
+                continue
+            (target,) = targets
+        start = tag.start("attrs") + name_match.start()
+        end = tag.start("attrs") + name_match.end()
+        edits.append((start, end, f' name="{target}"' if target else ""))
+        changes.setdefault(name, []).append(target)
+
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text, changes
 
 
 async def post_process_assembled(
@@ -556,6 +709,13 @@ async def post_process_assembled(
             "Restored translated ref group name(s) in %r: %s", source_title, renamed_groups
         )
 
+    text, renamed_refs = restore_ref_names(text, source_text)
+    if renamed_refs:
+        logger.info(
+            "Restored %d translated ref name(s) in %r: %s",
+            len(renamed_refs), source_title, renamed_refs,
+        )
+
     text, dropped_lists = drop_stray_reference_lists(text, source_text)
     if dropped_lists:
         logger.info(
@@ -576,6 +736,13 @@ async def post_process_assembled(
             "Moved %d ref definition(s) left after </references> back into the block in %r",
             moved_defs,
             source_title,
+        )
+
+    text, collapsed_refs = collapse_duplicate_list_defined_refs(text, source_text)
+    if collapsed_refs:
+        logger.info(
+            "Collapsed %d body definition(s) of list-defined ref(s) back to reuses in %r: %s",
+            len(collapsed_refs), source_title, collapsed_refs,
         )
 
     text, restored_refs = restore_orphaned_ref_definitions(text, source_text)
@@ -1053,12 +1220,13 @@ async def run_pipeline(
     reporter: ProgressReporter | None = None,
     stats_tracker: StatsTracker | None = None,
     resume_unfinished: bool = True,
+    resume_requested_only: bool = False,
 ) -> StatsTracker:
     stats_tracker = stats_tracker if stats_tracker is not None else StatsTracker()
     stats = stats_tracker.stats
 
     if resume_unfinished:
-        unfinished = unfinished_inputs(config, inputs)
+        unfinished = unfinished_inputs(config, inputs, requested_only=resume_requested_only)
         if unfinished:
             logger.info("Retrying %d unfinished article(s) before starting new work", len(unfinished))
             await run_pipeline(
@@ -1094,6 +1262,7 @@ async def run_pipeline(
 
     complex_client = client_pool.get(resolve_complex_provider(config)) if config.complex_model else None
 
+    article_locks: list[int] = []  # held until the run ends; the kernel also drops them if we crash
     try:
         pricing = await llm_client.get_pricing_for(config.model)
         complex_pricing = (
@@ -1111,6 +1280,20 @@ async def run_pipeline(
                 stats.articles_skipped += 1
                 logger.info("Skipping %r: output already exists", item.title)
                 continue
+            # Another harness process on this machine (different provider/model)
+            # may already be translating this article; two would overwrite each
+            # other's partial_output and burn tokens on the same work.
+            lock = try_lock_article(config.target_lang, output_path_for(config.partial_output_dir, item.title).stem)
+            if lock is None:
+                stats.articles_skipped += 1
+                logger.info("Skipping %r: another local process is already translating it", item.title)
+                continue
+            article_locks.append(lock)
+            if not force and article_already_done(config.output_dir, item.title):
+                # finished by the other process between our first check and getting the lock
+                stats.articles_skipped += 1
+                logger.info("Skipping %r: output already exists", item.title)
+                continue
             pending_items.append(item)
 
         fetch_sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
@@ -1122,9 +1305,10 @@ async def run_pipeline(
         )
 
         article_plans: list[tuple[ArticleSource, list[Chunk], VerifiedFacts]] = []
-        for plan in planned:
+        for item, plan in zip(pending_items, planned):
             if plan is None:
                 stats.articles_failed += 1
+                stats.article_results[item.title] = "failed"
                 continue
             article_plans.append(plan)
 
@@ -1414,6 +1598,7 @@ async def run_pipeline(
             failed_chunks = [c for c in chunks if c.status == ChunkStatus.FAILED]
             if failed_chunks or article_stats['failed']:
                 stats.articles_failed += 1
+                stats.article_results[source.title] = "failed"
                 logger.error(
                     "Article %r failed: %d of %d sections failed",
                     source.title, len(failed_chunks), len(chunks)
@@ -1438,6 +1623,7 @@ async def run_pipeline(
             )
             if combined_issues and not warning_findings:
                 stats.articles_needs_human_review += 1
+                stats.article_results[source.title] = "needs_human_review"
                 review_path = record_needs_human_review(config.output_dir, source.title, combined_issues, rounds_used)
                 logger.error(
                     "Article %r needs human review after %d assembly-level repair round(s) — see %s: %s",
@@ -1503,6 +1689,7 @@ async def run_pipeline(
             qa_issues = run_qa_checks(assembled)
             if qa_issues:
                 stats.articles_needs_human_review += 1
+                stats.article_results[source.title] = "needs_human_review"
                 review_path = record_needs_human_review(config.output_dir, source.title, qa_issues, rounds_used)
                 logger.error(
                     "Article %r failed the final QA gate — see %s: %s",
@@ -1521,6 +1708,7 @@ async def run_pipeline(
 
             path = save_article(config.output_dir, source.title, assembled)
             stats.articles_completed += 1
+            stats.article_results[source.title] = "completed"
             logger.info("Saved %s", path)
             discard_partial_article(config.partial_output_dir, source.title)
 
@@ -1552,6 +1740,8 @@ async def run_pipeline(
             )
 
     finally:
+        for lock in article_locks:
+            release_lock(lock)
         await mw_pool.aclose()
         # Closes every client the pool actually built (complex/review's
         # own client, only when routed to a different provider than the

@@ -1,4 +1,4 @@
-from wiki_translation_harness.notes import expand_cref_notes
+from wiki_translation_harness.notes import expand_cref_notes, lost_note_templates
 
 _SOURCE = """Lead.{{Cref2|a}} Body.{{Cref2|b}} Again.{{Cref2|a}}
 
@@ -53,3 +53,23 @@ def test_expand_cref_notes_skips_a_marker_inside_a_ref():
     result = expand_cref_notes(text)
     assert result.unresolved == ["a"]
     assert "{{Cref2|a}}" in result.patched_wikitext
+
+
+_NOTES_CHUNK = """== Shënime ==
+{{Listë shënimesh|notes=
+{{Efn|name=best-fit ellipsoid|Elipsoidi i përshtatjes më të mirë}}
+}}
+"""
+
+
+def test_lost_note_templates_flags_a_notelist_rewritten_as_a_ref():
+    mangled = '== Shënime ==\n<ref group="caption">Elipsoidi i përshtatjes më të mirë</ref>\n'
+    assert lost_note_templates(_NOTES_CHUNK, mangled) == ["listë shënimesh", "efn"]
+
+
+def test_lost_note_templates_treats_notelist_as_its_sqwiki_redirect():
+    assert lost_note_templates(_NOTES_CHUNK, _NOTES_CHUNK.replace("Listë shënimesh", "Notelist")) == []
+
+
+def test_lost_note_templates_ignores_chunks_without_notes():
+    assert lost_note_templates("Tekst e thjeshtë.", "Tekst tjetër.") == []

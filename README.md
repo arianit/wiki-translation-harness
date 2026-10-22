@@ -20,8 +20,9 @@ repairs, caches, verifies facts, and saves. It never publishes anything.
    the translation-memory cache are reused.
 4. Validate each chunk. On a defect, ask the model to repair it; if repair
    fails, the article fails and is not saved (partial progress is kept).
-   Before starting new translations, the harness retries unfinished articles
-   from `partial_output_dir`, one at a time, reusing matching cached sections.
+   Before starting new translations, an explicit title/category/file run retries
+   only unfinished articles from that request. Queue mode can retry the shared
+   unfinished backlog, one at a time, reusing matching cached sections.
    Each unfinished article gets one attempt per run before new work begins,
    including with `--no-sequential`. Queue mode retries this local backlog
    before claiming new articles, counting retries toward `--max-articles`.
@@ -91,9 +92,23 @@ When it finishes you get `Dresnik_archaeological_site.wiki` (the Albanian wikite
 ready to paste into sq.wikipedia) and `Dresnik_archaeological_site.report.md` (what
 was checked and what to review) in the output folder (see **Output**).
 
+If the article has a line in the shared queue (see **Queue mode**), the run
+also marks it `DONE` or `FAILED` there, with the engine that produced it, and
+pushes the change. A failure never downgrades a `DONE` line or takes a pending
+one off the queue. Add `--no-mark` to leave the queue alone.
+
 ### Translate several articles
 
-Put one title per line in a text file. Empty lines and lines starting with
+You can repeat `--title` directly on the command line:
+
+```bash
+wiki-translation-harness \
+  --title "Drini Bridge" \
+  --title "Cërmjan" \
+  --title "https://en.wikipedia.org/wiki/Paleokastra_Castle"
+```
+
+For a longer or reusable list, put one title per line in a text file. Empty lines and lines starting with
 `#` are ignored:
 
 ```text
@@ -155,10 +170,12 @@ See **Engines** for the options.
 
 ### If a run stops halfway
 
-Run the same command again. Finished articles are skipped, and sections
-already translated are reused from the cache
+Run the same command again. Finished articles are skipped, requested articles
+with partial drafts are resumed, and sections already translated are reused from the cache
 (`cache/translation_memory.sqlite3`), so you don't pay for them twice. To
-translate an article again from scratch, add `--force`.
+translate an article again from scratch, add `--force`. To start only the
+requested articles and ignore drafts left in `partial_output/`, add
+`--fresh` (equivalent to `--no-resume`).
 
 ### Other flags
 
@@ -304,6 +321,20 @@ actually ran (e.g. `DONE\tgpt-6-luna@codex`). When the review pass ran, the
 reviewer is added as a third field: `DONE\tgpt-6-luna@codex\treview=claude-sonnet-5-5@claude_code`. A claim older than
 `--stale-hours` (default 3) is treated as abandoned. The clone location is
 `--queue-repo-dir` (default `~/code/wiki-translation-queue`).
+
+Add `--fresh` to start only articles no agent has begun: the local
+`partial_output/` backlog is skipped and stale `CLAIMED` lines left by
+another worker are never reclaimed — only a line with no status is claimed.
+Without it (default), unfinished local drafts are retried first and
+abandoned claims are picked up, so a run can resume or duplicate work
+another agent started.
+
+Several runs on one computer (different providers) are safe together: queue
+updates are serialised by a machine-wide lock, each article is locked while it
+is translated (a second process skips it), and a claim names its owner as
+`host:pid:provider` so a still-running local worker's claim is never reclaimed
+as stale. Lock files live in `~/.cache/wiki-translation-harness/locks`
+(`WIKI_HARNESS_LOCK_DIR` overrides).
 
 ### Reviewing finished drafts
 
