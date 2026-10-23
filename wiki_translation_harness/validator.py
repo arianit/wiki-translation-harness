@@ -308,12 +308,17 @@ def _parse_table_rows(block: str) -> list[tuple[int, list[tuple[int, int]]]] | N
     current_row_offset = 0
     row_offset_set = False  # points at the first content line, not the |- delimiter
     in_row = False
+    implicit_first_row = False  # the row between "{|" and the first "|-"
     offset = 0
     for line in block.split("\n"):
         stripped = line.rstrip()
-        if stripped.startswith("|-"):
-            if in_row:
+        if stripped.startswith("{|"):
+            in_row = True
+            implicit_first_row = True
+        elif stripped.startswith("|-"):
+            if in_row and not (implicit_first_row and not current_cells):
                 rows.append((current_row_offset, current_cells))
+            implicit_first_row = False
             current_cells = []
             current_row_offset = offset
             row_offset_set = False

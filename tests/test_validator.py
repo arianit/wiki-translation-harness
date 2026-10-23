@@ -184,6 +184,15 @@ def test_fixture_table_span_trailing_block_not_flagged():
     assert result.valid
 
 
+def test_fixture_table_span_first_row_without_delimiter_not_flagged():
+    # The first row sits straight after "{|" with no "|-" before it. It used to
+    # be dropped, so its rowspan never reached the second row and that row
+    # looked one cell short — seen on the English "Periodic table" article's
+    # Electron configurations table, where the pristine source tripped it.
+    result = validate_wikitext(_load_fixture("table_span_first_row_without_delimiter_not_flagged.wiki"))
+    assert result.valid
+
+
 def test_fixture_clean_valid_has_no_issues():
     # Ordinary sqwiki prose using convert/Sfn/a table correctly — the four
     # new checks must not false-positive on legitimate usage.

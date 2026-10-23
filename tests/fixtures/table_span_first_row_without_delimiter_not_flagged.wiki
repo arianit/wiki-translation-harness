@@ -1,0 +1,15 @@
+{| class="wikitable"
+! ℓ =
+! 0
+! 1
+! rowspan=2 | Kapaciteti
+|-
+! Orbitali
+! s
+! p
+|-
+! ''n'' = 1
+| 1s
+| colspan=1 |
+| 2
+|}
