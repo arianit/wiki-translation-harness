@@ -227,6 +227,11 @@ generate_reports: true
 live_validate: true
 live_validate_timeout_s: 30
 max_assembly_repair_rounds: 3
+# Save an article whose only findings left after those rounds are warnings
+# (a template or Lua module missing on the target wiki), writing them to
+# {title}.review-flags.md instead of holding the article back. Errors
+# (Cite errors, unbalanced markup, QA defects) still go to needs_human_review.
+save_with_warnings: false
 assembly_repair_concurrency: 4  # chunks repaired in parallel per round
 
 # Fills any citation missing |language= in the final assembled article, and

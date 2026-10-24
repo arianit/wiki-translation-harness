@@ -37,7 +37,13 @@ from wiki_translation_harness.citation_language import (
 from wiki_translation_harness.report import build_attribution_block
 from wiki_translation_harness.live_validator import validate_wikitext_live
 from wiki_translation_harness.mediawiki import MediaWikiClient, MediaWikiClientPool
-from wiki_translation_harness.notes import expand_cref_notes
+from wiki_translation_harness.notes import (
+    IMPLICIT_NOTE_GROUP,
+    NOTELIST_ALIASES,
+    expand_cref_notes,
+    normalize_notelist_aliases,
+    uses_implicit_note_group,
+)
 from wiki_translation_harness.models import (
     ArticleSource,
     Chunk,
@@ -249,6 +255,13 @@ def restore_ref_group_names(text: str, source_text: str) -> tuple[str, dict[str,
     group went missing in translation as exactly one new one appeared.
     Returns (patched_text, {translated_name: source_name})."""
     source_groups = {_group_value(m) for m in _GROUP_ATTR_RE.finditer(source_text)}
+    # {{Efn}} and {{Notelist}} put their notes in lower-alpha when the source
+    # names no group, so that group exists in the source without being
+    # written there. The model then invents one for the {{Efn}} it turns into
+    # a <ref> (Mount Everest "note", Washington D.C. and Periodic table "sh"),
+    # and sqwiki's {{Listë shënimesh}} lists lower-alpha only.
+    if uses_implicit_note_group(source_text):
+        source_groups.add(IMPLICIT_NOTE_GROUP)
     text_groups = {_group_value(m) for m in _GROUP_ATTR_RE.finditer(text)}
     unknown = text_groups - source_groups
     if not unknown:
@@ -276,7 +289,9 @@ def restore_ref_group_names(text: str, source_text: str) -> tuple[str, dict[str,
 _REF_LIST_RENDERER_RE = re.compile(
     r"<references\b(?P<tag_attrs>[^>]*?)/>"
     r"|<references\b(?P<pair_attrs>[^>]*)>\s*</references\s*>"
-    r"|\{\{\s*(?P<tpl>reflist|references|notelist|listë shënimesh)\s*(?P<tpl_args>\|[^{}\n]*)?\}\}",
+    r"|\{\{\s*(?P<tpl>reflist|references|notelist|listë shënimesh"
+    + "".join("|" + re.escape(a).replace(r"\ ", r"\s+") for a in NOTELIST_ALIASES)
+    + r")\s*(?P<tpl_args>\|[^{}\n]*)?\}\}",
     re.IGNORECASE,
 )
 
@@ -288,9 +303,25 @@ def _ref_list_key(match: re.Match[str]) -> tuple[str, str] | None:
     attrs = match.group("tag_attrs") or match.group("pair_attrs") or match.group("tpl_args") or ""
     if tpl and re.search(r"\|\s*refs\s*=", attrs, re.IGNORECASE):
         return None
-    kind = "notelist" if tpl and tpl.lower() in ("notelist", "listë shënimesh") else "refs"
     group = _GROUP_ATTR_RE.search(attrs)
-    return kind, _group_value(group) if group else ""
+    group_name = _group_value(group) if group else ""
+    if tpl and tpl.lower() not in ("reflist", "references"):
+        # A note list is a reflist for the group its notes are in, so the
+        # model writing {{Reflist|group=lower-alpha}} for {{notelist}}
+        # counts as the same list.
+        return "refs", group_name or IMPLICIT_NOTE_GROUP
+    return "refs", group_name
+
+
+_NOTES_HEADING_RE = re.compile(r"=+\s*(?:notes?|shënim\w*)\s*=+\s*", re.IGNORECASE)
+
+
+def _under_notes_heading(text: str, pos: int) -> bool:
+    """True when the last non-blank line before `pos` is a Notes/Shënime heading."""
+    for line in reversed(text[:pos].splitlines()):
+        if line.strip():
+            return _NOTES_HEADING_RE.fullmatch(line.strip()) is not None
+    return False
 
 
 def drop_stray_reference_lists(text: str, source_text: str) -> tuple[str, int]:
@@ -307,8 +338,9 @@ def drop_stray_reference_lists(text: str, source_text: str) -> tuple[str, int]:
     headings.
 
     For each (kind, group), keeps as many renderers as the source has
-    — the last ones, since reference lists close an article — and removes
-    the rest, whole line and all where the renderer stood alone.
+    — one directly under a Notes heading first, then the last ones, since
+    reference lists close an article — and removes the rest, whole line
+    and all where the renderer stood alone.
     Returns (patched_text, removed_count)."""
     allowed: dict[tuple[str, str], int] = {}
     for m in _REF_LIST_RENDERER_RE.finditer(source_text):
@@ -325,7 +357,18 @@ def drop_stray_reference_lists(text: str, source_text: str) -> tuple[str, int]:
     spans: list[tuple[int, int]] = []
     for key, matches in by_key.items():
         excess = len(matches) - allowed.get(key, 0)
-        for m in matches[: max(excess, 0)]:
+        if excess > 0:
+            # A list directly under the Notes heading is where the source
+            # has it; the model's other copies are strays even when one of
+            # them is the last in the file.
+            kept = sorted(
+                range(len(matches)),
+                key=lambda i: (not _under_notes_heading(text, matches[i].start()), -i),
+            )[: len(matches) - excess]
+            removed = [matches[i] for i in range(len(matches)) if i not in kept]
+        else:
+            removed = []
+        for m in removed:
             start, end = m.span()
             line_start = text.rfind("\n", 0, start) + 1
             line_end = text.find("\n", end)
@@ -1159,6 +1202,11 @@ async def _plan_article(
             logger.error("Failed to fetch %r (lang=%s): %s", item.title, effective_lang, exc)
             return None
 
+        normalized_wikitext, aliased = normalize_notelist_aliases(source.wikitext)
+        if aliased:
+            source = source.model_copy(update={"wikitext": normalized_wikitext})
+            logger.info("Rewrote %d note-list alias template(s) to {{notelist}} in %r", aliased, source.title)
+
         # Before verification/chunking: a {{Cref2}} marker and its {{Cnote2}}
         # text live in different chunks, so they must be joined on the whole
         # source (see notes.py). Replaces `source` so the reviewer compares
@@ -1325,7 +1373,10 @@ async def run_pipeline(
                     )
 
         if reporter is not None:
-            reporter.set_plan(len(article_plans), total_chunks, estimated_cost)
+            reporter.set_plan(
+                len(article_plans), total_chunks, estimated_cost,
+                {source.title: len(chunks) for source, chunks, _ in article_plans},
+            )
 
         slot_queue: asyncio.Queue[int] = asyncio.Queue()
         for i in range(config.workers):

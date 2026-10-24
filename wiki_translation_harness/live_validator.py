@@ -72,7 +72,16 @@ _COUNTRY_DATA_LEAK_RE = re.compile(r"Country[\s_-]data[\s_]\S+", re.IGNORECASE)
 # missing on sq.wikipedia itself), not something translating an article
 # introduces or could ever fix. Confirmed missing via the API on Nagarjuna
 # 2026-09-06.
-_KNOWN_HARMLESS_MISSING_DEPENDENCY_MODULES = {"Moduli:WikidataIB/i18n", "Moduli:SST/registry"}
+# Moduli:TNT/config: embedded in sq.wikipedia's own Stampa:Div col,
+# Stampa:Refbegin, Stampa:Refend and Moduli:Citation/CS1, so any article
+# using a column list or a citation reaches it; the rendered Nigeria draft
+# had no script error. Reported on Algeria, Imperialism, Nigeria, Pakistan,
+# Propaganda and Sun, each held back by this warning alone. Checked 2026-10-24.
+_KNOWN_HARMLESS_MISSING_DEPENDENCY_MODULES = {
+    "Moduli:WikidataIB/i18n",
+    "Moduli:SST/registry",
+    "Moduli:TNT/config",
+}
 
 # Phantom template dependency: reported by action=parse's `templates` list but
 # absent from the article wikitext, absent from every existing template's raw

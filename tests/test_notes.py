@@ -1,4 +1,9 @@
-from wiki_translation_harness.notes import expand_cref_notes, lost_note_templates
+from wiki_translation_harness.notes import (
+    expand_cref_notes,
+    lost_note_templates,
+    normalize_notelist_aliases,
+    uses_implicit_note_group,
+)
 
 _SOURCE = """Lead.{{Cref2|a}} Body.{{Cref2|b}} Again.{{Cref2|a}}
 
@@ -73,3 +78,25 @@ def test_lost_note_templates_treats_notelist_as_its_sqwiki_redirect():
 
 def test_lost_note_templates_ignores_chunks_without_notes():
     assert lost_note_templates("Tekst e thjeshtë.", "Tekst tjetër.") == []
+
+
+def test_normalize_notelist_aliases_rewrites_enwiki_redirects():
+    # Regression (Los Angeles {{nlist}}, Julius Caesar {{noteslist}}).
+    text = "==Notes==\n{{nlist}}\n{{Notes list|colwidth=30em}}\n{{ NLS }}\n{{notelist|group=note}}\n{{efn|x}}\n"
+    patched, count = normalize_notelist_aliases(text)
+    assert count == 3
+    assert patched == (
+        "==Notes==\n{{notelist}}\n{{notelist|colwidth=30em}}\n{{ notelist }}\n{{notelist|group=note}}\n{{efn|x}}\n"
+    )
+
+
+def test_normalize_notelist_aliases_leaves_longer_template_names_alone():
+    text = "{{noteslistfoo}} {{Nlistx|a}} {{nlist-ish}}"
+    assert normalize_notelist_aliases(text) == (text, 0)
+
+
+def test_uses_implicit_note_group():
+    assert uses_implicit_note_group("A.{{efn|Note.}}")
+    assert uses_implicit_note_group("==Notes==\n{{notelist}}")
+    assert not uses_implicit_note_group("A.{{efn|group=note|Note.}}\n{{notelist|group=note}}")
+    assert not uses_implicit_note_group("Plain prose.")

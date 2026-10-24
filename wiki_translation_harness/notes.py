@@ -29,6 +29,26 @@ _DEFAULT_GROUP = "upper-alpha"
 
 _NOTE_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]+")
 
+# enwiki redirects to Template:Notelist (checked 2026-10-24). sqwiki only has
+# Notelist and Notes, so the model leaves the others untranslated or swaps
+# them for a {{Reflist|group=lower-alpha}} of its own, and nothing downstream
+# recognises them as the source's note list.
+NOTELIST_ALIASES = ("nlist", "noteslist", "notes list", "note list", "nls", "notes", "efnlist")
+_NOTELIST_ALIAS_RE = re.compile(
+    r"(\{\{\s*)(?:" + "|".join(re.escape(a).replace(r"\ ", r"\s+") for a in NOTELIST_ALIASES) + r")(?=\s*[|}])",
+    re.IGNORECASE,
+)
+
+
+def normalize_notelist_aliases(wikitext: str) -> tuple[str, int]:
+    """Rewrites enwiki's {{Nlist}}/{{Noteslist}}/... to {{notelist}} so the
+    model translates it to {{Listë shënimesh}} and the group/list checks
+    count it. Los Angeles and Julius Caesar ({{nlist}}, {{noteslist}}) lost
+    their note list this way: it was counted as no list at all, so the
+    cleanup removed every <references group="lower-alpha"> the model wrote,
+    the one under "Shënime" included. Returns (patched_text, rewritten_count)."""
+    return _NOTELIST_ALIAS_RE.subn(r"\1notelist", wikitext)
+
 
 def _norm(name: object) -> str:
     return re.sub(r"\s+", " ", str(name).strip()).lower()
@@ -153,6 +173,18 @@ def expand_cref_notes(wikitext: str) -> NoteExpansionResult:
 
 
 _NOTE_TEMPLATE_RE = re.compile(r"\{\{\s*(notelist|listë shënimesh|efn)\s*[|}]", re.IGNORECASE)
+# Templates that put notes in lower-alpha when they carry no |group=.
+_IMPLICIT_GROUP_TEMPLATES = {"efn", "notelist", "listë shënimesh", *NOTELIST_ALIASES}
+IMPLICIT_NOTE_GROUP = "lower-alpha"
+
+
+def uses_implicit_note_group(wikitext: str) -> bool:
+    """True when some {{Efn}}/{{Notelist}} names no group, which puts its
+    notes in lower-alpha without that word appearing in the source."""
+    for tmpl in mwp.parse(wikitext).filter_templates():
+        if _norm(tmpl.name) in _IMPLICIT_GROUP_TEMPLATES and not tmpl.has("group", ignore_empty=True):
+            return True
+    return False
 
 
 def _note_template_counts(text: str) -> dict[str, int]:

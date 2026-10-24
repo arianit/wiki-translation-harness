@@ -502,6 +502,60 @@ def test_restore_ref_group_names_leaves_ambiguous_groups_alone():
     assert restore_ref_group_names(text, source) == (text, {})
 
 
+def test_restore_ref_group_names_maps_invented_group_to_the_implicit_efn_group():
+    # Regression (Mount Everest, Periodic table): the source names no group;
+    # {{efn}} puts its notes in lower-alpha and sqwiki's {{Listë shënimesh}}
+    # lists only that group. The model rewrote the efn as <ref group="sh">.
+    source = "x{{efn|Note.}}\n==Notes==\n{{notelist}}\n"
+    text = 'x<ref group="sh">Shënim.</ref>\n<ref group="note" name="b" />\n== Shënime ==\n{{Listë shënimesh}}\n'
+    patched, renamed = restore_ref_group_names(text, source)
+    assert renamed == {"sh": "lower-alpha", "note": "lower-alpha"}
+    assert 'group="sh"' not in patched and 'group="note"' not in patched
+    assert patched.count('group="lower-alpha"') == 2
+
+
+def test_restore_ref_group_names_ignores_implicit_group_when_every_note_names_one():
+    source = "x{{efn|group=note|Note.}}\n{{notelist|group=note}}\n"
+    text = 'x<ref group="shënim">Shënim.</ref>\n{{Listë shënimesh|group=shënim}}\n'
+    patched, renamed = restore_ref_group_names(text, source)
+    assert renamed == {"shënim": "note"}
+
+
+def test_drop_stray_reference_lists_counts_a_notelist_as_a_lower_alpha_reflist():
+    # Regression (Los Angeles, Julius Caesar): every list the model wrote
+    # was removed because the source's {{nlist}} counted as no list at all.
+    source = "x{{efn|Note.}}\n==Notes==\n{{notelist}}\n==References==\n{{reflist}}\n"
+    text = (
+        'x{{Efn|Shënim.}}\n<references group="lower-alpha" />\n== Shënime ==\n'
+        "{{Reflist|group=lower-alpha}}\n== Referime ==\n{{Reflist}}\n"
+    )
+    patched, removed = drop_stray_reference_lists(text, source)
+    assert removed == 1
+    assert patched == (
+        "x{{Efn|Shënim.}}\n== Shënime ==\n{{Reflist|group=lower-alpha}}\n== Referime ==\n{{Reflist}}\n"
+    )
+
+
+def test_drop_stray_reference_lists_keeps_the_list_under_the_notes_heading():
+    source = "x{{efn|Note.}}\n==Notes==\n{{notelist}}\n==References==\n{{reflist}}\n"
+    text = (
+        'x{{Efn|Shënim.}}\n== Shënime ==\n{{Reflist|group=lower-alpha}}\n== Referime ==\n{{Reflist}}\n'
+        '{{Authority control}}\n<references group="lower-alpha"/>\n'
+    )
+    patched, removed = drop_stray_reference_lists(text, source)
+    assert removed == 1
+    assert patched == (
+        "x{{Efn|Shënim.}}\n== Shënime ==\n{{Reflist|group=lower-alpha}}\n== Referime ==\n{{Reflist}}\n"
+        "{{Authority control}}\n"
+    )
+
+
+def test_drop_stray_reference_lists_recognises_enwiki_notelist_aliases():
+    source = "x\n{{nlist}}\n"
+    text = "x\n{{Listë shënimesh}}\n"
+    assert drop_stray_reference_lists(text, source) == (text, 0)
+
+
 def test_drop_stray_reference_lists_removes_lists_the_source_lacks():
     # Regression (Albert Einstein): the source's one <references> block
     # came back with a <references group=.../> or <references /> after
