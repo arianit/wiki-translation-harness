@@ -37,6 +37,8 @@ from wiki_translation_harness.citation_language import (
 from wiki_translation_harness.report import build_attribution_block
 from wiki_translation_harness.live_validator import validate_wikitext_live
 from wiki_translation_harness.mediawiki import MediaWikiClient, MediaWikiClientPool
+from wiki_translation_harness.hatnote_ill import add_ill_to_hatnotes
+from wiki_translation_harness.ref_template import expand_r_definitions
 from wiki_translation_harness.notes import (
     IMPLICIT_NOTE_GROUP,
     NOTELIST_ALIASES,
@@ -533,6 +535,79 @@ def restore_orphaned_ref_definitions(text: str, source_text: str) -> tuple[str, 
     return _REF_SELF_CLOSING_RE.sub(_restore, text), restored
 
 
+def drop_unsupported_ref_reuses(text: str, source_text: str) -> tuple[str, list[str]]:
+    """Remove `<ref name="x" />` reuses of a name that nothing defines.
+
+    The model sometimes invents a descriptive name for a citation
+    (`corona-particle-density`, `Sun-Rotation-rotation` on the Sun run) and
+    reuses it in several places without ever writing the definition. The
+    source has no such name, so restore_orphaned_ref_definitions has nothing
+    to copy back and the repair loop can only invent a citation; every use
+    is a Cite error. A name that appears nowhere in the source and is
+    defined nowhere in the translation is unsupported, so its reuses go.
+
+    Returns (patched_text, dropped_names)."""
+    defined = {_ref_name(m) for m in _REF_DEFINITION_RE.finditer(text)}
+    dropped: list[str] = []
+
+    def _drop(match: re.Match[str]) -> str:
+        name = _ref_name(match)
+        if name in defined or name in source_text:
+            return match.group(0)
+        if name not in dropped:
+            dropped.append(name)
+        return ""
+
+    return _REF_SELF_CLOSING_RE.sub(_drop, text), dropped
+
+
+def collapse_conflicting_ref_definitions(text: str, source_text: str) -> tuple[str, list[str]]:
+    """Turn the later definitions of a name into reuses when the model
+    translated identical source definitions differently.
+
+    A source may repeat `<ref name="short">All numbers ... short scale</ref>`
+    word for word in several sections (Sun does, twice). Each copy is
+    translated in its own chunk, the wording differs, and Cite reports the
+    name as defined multiple times with different content. Only names whose
+    source definitions all agree are touched; the first definition stays.
+
+    Returns (patched_text, collapsed_names)."""
+    def _squash(body: str) -> str:
+        return re.sub(r"\s+", " ", body).strip()
+
+    source_bodies: dict[str, set[str]] = {}
+    for m in _REF_DEFINITION_RE.finditer(source_text):
+        source_bodies.setdefault(_ref_name(m), set()).add(_squash(m.group(4)))
+
+    seen: dict[str, str] = {}
+    conflicting: set[str] = set()
+    for m in _REF_DEFINITION_RE.finditer(text):
+        name, body = _ref_name(m), _squash(m.group(4))
+        if name in seen and seen[name] != body and len(source_bodies.get(name, ())) == 1:
+            conflicting.add(name)
+        seen.setdefault(name, body)
+    if not conflicting:
+        return text, []
+
+    first: set[str] = set()
+    collapsed: list[str] = []
+
+    def _collapse(match: re.Match[str]) -> str:
+        name = _ref_name(match)
+        if name not in conflicting:
+            return match.group(0)
+        if name not in first:
+            first.add(name)
+            return match.group(0)
+        if name not in collapsed:
+            collapsed.append(name)
+        # Keep the opening tag's attributes: a reuse must name the same group.
+        opening = re.match(r"<ref\b[^>]*>", match.group(0)).group(0)
+        return opening[:-1].rstrip() + " />"
+
+    return _REF_DEFINITION_RE.sub(_collapse, text), collapsed
+
+
 _REF_TAG_RE = re.compile(
     r"<ref\b(?P<attrs>[^>]*?)(?:/>|(?<!/)>(?P<body>(?:(?!<ref\b).)*?)</ref\s*>)",
     re.IGNORECASE | re.DOTALL,
@@ -627,6 +702,8 @@ async def post_process_assembled(
     source_text: str,
     config: Config,
     citation_client: httpx.AsyncClient | None,
+    target_mw_client: MediaWikiClient | None = None,
+    source_lang: str = "en",
 ) -> tuple[str, dict[str, str] | None]:
     """Deterministic string-level fixes for an assembled article. Run on
     every fresh assembly — after each assembly-repair round and each
@@ -765,6 +842,19 @@ async def post_process_assembled(
             "Removed %d reference list(s) not in the source from %r", dropped_lists, source_title
         )
 
+    if target_mw_client is not None:
+        try:
+            text, ill_titles = await add_ill_to_hatnotes(
+                text, source_text, target_mw_client.existing_pages, source_lang
+            )
+            if ill_titles:
+                logger.info(
+                    "Gave %d hatnote target(s) missing on the target wiki an {{ill}} in %r: %s",
+                    len(ill_titles), source_title, ill_titles,
+                )
+        except Exception as exc:
+            logger.warning("Hatnote {{ill}} fix failed for %r: %s", source_title, exc)
+
     text, merged_refs_blocks = merge_split_references_blocks(text)
     if merged_refs_blocks:
         logger.info(
@@ -795,6 +885,20 @@ async def post_process_assembled(
             len(restored_refs),
             source_title,
             restored_refs,
+        )
+
+    text, dropped_reuses = drop_unsupported_ref_reuses(text, source_text)
+    if dropped_reuses:
+        logger.info(
+            "Removed reuses of %d ref name(s) that neither the source nor the translation defines in %r: %s",
+            len(dropped_reuses), source_title, dropped_reuses,
+        )
+
+    text, collapsed_defs = collapse_conflicting_ref_definitions(text, source_text)
+    if collapsed_defs:
+        logger.info(
+            "Collapsed repeated definitions of %d ref name(s) the model translated differently in %r: %s",
+            len(collapsed_defs), source_title, collapsed_defs,
         )
 
     return text, citation_languages_filled
@@ -834,7 +938,9 @@ async def run_assembly_repair(
 
     async def _post_process(text: str) -> str:
         nonlocal citation_languages_filled
-        text, filled = await post_process_assembled(text, source.title, source_text, config, citation_client)
+        text, filled = await post_process_assembled(
+            text, source.title, source_text, config, citation_client, target_mw_client, source.source_lang
+        )
         if filled is not None:
             citation_languages_filled = filled
         return text
@@ -1025,6 +1131,49 @@ def _localize_review_issues(
     return localized, broadcast
 
 
+_QUOTED_FORM_RE = re.compile(r"[“\"«]([^”\"»]{2,60})[”\"»]")
+
+
+def _consistency_directives(
+    issues: list[ValidationIssue], chunks: list[Chunk]
+) -> dict[int, list[str]]:
+    """Per-chunk instructions that settle an entity_consistency finding for
+    the whole article.
+
+    The reviewer names the competing spellings in quotes (Josephus is
+    "Flavio Josefi" here and "Flavius Jozefi" later) but a finding reaches
+    only the chunk its snippet sits in, whose model cannot see the other
+    form: it may choose the opposite one, and the next review flags the
+    reverse (Religion, Fundamentalism, Pakistan). Here the form used most
+    across the chunks becomes canonical (the first one named on a tie) and
+    every chunk using another form is told to switch to it."""
+    directives: dict[int, list[str]] = {}
+    for issue in issues:
+        if issue.kind != "entity_consistency":
+            continue
+        forms: list[str] = []
+        for form in _QUOTED_FORM_RE.findall(issue.message):
+            form = form.strip().rstrip(".,;")
+            if form and form not in forms:
+                forms.append(form)
+        counts = {f: sum((c.translated_text or "").count(f) for c in chunks) for f in forms}
+        present = [f for f in forms if counts[f]]
+        if len(present) < 2:
+            continue
+        canonical = max(present, key=lambda f: (counts[f], -forms.index(f)))
+        for chunk in chunks:
+            text = chunk.translated_text or ""
+            others = [f for f in present if f != canonical and f in text]
+            if others:
+                directives.setdefault(id(chunk), []).append(
+                    f"error: spell this consistently across the whole article: use “{canonical}” "
+                    f"(the form used most) wherever this section has "
+                    + ", ".join(f"“{f}”" for f in others)
+                    + ", adjusting only the grammatical ending where the sentence needs it"
+                )
+    return directives
+
+
 async def run_review_pass(
     chunks: list[Chunk],
     source: ArticleSource,
@@ -1098,6 +1247,16 @@ async def run_review_pass(
     )
     combined = structural_issues + review_findings
 
+    def _has_structural_error(issues: list[ValidationIssue]) -> bool:
+        return any(i.severity == "error" for i in issues)
+
+    # The last state without a structural error: a review-driven rewrite can
+    # break the markup (Religion came out with one more "}}" than "{{"), and
+    # shipping that with a flag is worse than shipping the unreviewed text.
+    clean: tuple[list[str | None], str, list[ValidationIssue]] | None = None
+    if not _has_structural_error(structural_issues):
+        clean = ([c.translated_text for c in chunks], assembled, review_findings)
+
     rounds_used = 0
     while combined and rounds_used < config.review_max_repair_attempts:
         rounds_used += 1
@@ -1109,9 +1268,12 @@ async def run_review_pass(
         structural_localized, structural_broadcast = _localize_review_issues(structural_issues, assembled, spans)
         review_localized, review_broadcast = _localize_review_issues(review_findings, assembled, spans)
 
+        consistency = _consistency_directives(review_findings, chunks)
         for chunk in chunks:
             structural_for_chunk = structural_localized.get(id(chunk), []) + structural_broadcast
-            findings_for_chunk = review_localized.get(id(chunk), []) + review_broadcast
+            findings_for_chunk = (
+                review_localized.get(id(chunk), []) + review_broadcast + consistency.get(id(chunk), [])
+            )
             if not structural_for_chunk and not findings_for_chunk:
                 continue
             stats.review_attempts += 1
@@ -1174,13 +1336,26 @@ async def run_review_pass(
 
         removed_comments.extend(reconcile_chunk_comments(chunks))
         assembled, _ = await post_process_assembled(
-            assemble_chunks(chunks), source.title, source_text, config, citation_client
+            assemble_chunks(chunks), source.title, source_text, config, citation_client,
+            target_mw_client, source.source_lang,
         )
         structural_issues = await _validate_assembled(
             assembled, target_mw_client, source.title, config.live_validate, config.live_validate_timeout_s
         )
         review_findings = await _run_review_call(assembled)
         combined = structural_issues + review_findings
+        if not _has_structural_error(structural_issues):
+            clean = ([c.translated_text for c in chunks], assembled, review_findings)
+
+    if _has_structural_error(structural_issues) and clean is not None:
+        logger.warning(
+            "Review-driven repair left a structural error in %r (%s); restoring the last text without one",
+            source.title, "; ".join(i.message for i in structural_issues if i.severity == "error"),
+        )
+        for chunk, text in zip(chunks, clean[0]):
+            chunk.translated_text = text
+        assembled = clean[1]
+        combined = [i for i in clean[2]]
 
     return assembled, combined, rounds_used, removed_comments
 
@@ -1206,6 +1381,14 @@ async def _plan_article(
         if aliased:
             source = source.model_copy(update={"wikitext": normalized_wikitext})
             logger.info("Rewrote %d note-list alias template(s) to {{notelist}} in %r", aliased, source.title)
+
+        expanded_wikitext, r_converted, r_skipped = expand_r_definitions(source.wikitext)
+        if r_converted or r_skipped:
+            source = source.model_copy(update={"wikitext": expanded_wikitext})
+            logger.info(
+                "Rewrote %d {{R}} reference definition(s) as <ref> tags in %r%s",
+                r_converted, source.title, f"; left {r_skipped} it could not model" if r_skipped else "",
+            )
 
         # Before verification/chunking: a {{Cref2}} marker and its {{Cnote2}}
         # text live in different chunks, so they must be joined on the whole
@@ -1710,7 +1893,8 @@ async def run_pipeline(
                         if switched:
                             # A failed review may already have repaired chunks.
                             assembled, _ = await post_process_assembled(
-                                assemble_chunks(chunks), source.title, source.wikitext, config, citation_client
+                                assemble_chunks(chunks), source.title, source.wikitext, config, citation_client,
+                                target_mw_client, source.source_lang,
                             )
                             continue
                         raise

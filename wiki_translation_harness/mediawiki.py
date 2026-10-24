@@ -162,6 +162,34 @@ class MediaWikiClient:
                 results[name] = title if pages.get(title) else None
         return results
 
+    async def existing_pages(self, titles: list[str]) -> dict[str, bool]:
+        """Title -> whether a page of that title exists, following redirects.
+        A "#section" suffix is ignored."""
+        results: dict[str, bool] = {}
+        for start in range(0, len(titles), 50):
+            batch = titles[start : start + 50]
+            params = {
+                "action": "query",
+                "titles": "|".join(t.split("#")[0] for t in batch),
+                "redirects": "1",
+                "format": "json",
+                "formatversion": "2",
+            }
+            resp = await asyncio.wait_for(
+                self._client.get(self.api_url, params=params), timeout=self._hard_timeout
+            )
+            resp.raise_for_status()
+            query = resp.json().get("query", {})
+            normalized = {m["from"]: m["to"] for m in query.get("normalized", [])}
+            redirects = {m["from"]: m["to"] for m in query.get("redirects", [])}
+            pages = {page["title"]: not page.get("missing", False) for page in query.get("pages", [])}
+            for title in batch:
+                name = title.split("#")[0]
+                name = normalized.get(name, name)
+                name = redirects.get(name, name)
+                results[title] = pages.get(name, False)
+        return results
+
     async def parse_wikitext(self, text: str, title: str = "API") -> dict:
         """Live-render wikitext via action=parse, for post-translation
         validation only (Lua/cite errors, missing templates, redlinks) —

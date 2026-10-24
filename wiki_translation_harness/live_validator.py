@@ -153,7 +153,7 @@ def find_live_issues(parse_result: dict, source_text: str = "") -> list[Validati
     seen_cite_msgs: set[str] = set()
     for match in _ERROR_SPAN_RE.finditer(html):
         cls = match.group("cls").lower()
-        msg = _strip_html(match.group("msg"))
+        msg = re.sub(r"\s+", " ", _strip_html(match.group("msg")))
         if not msg:
             continue
 

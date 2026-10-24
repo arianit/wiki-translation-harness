@@ -18,17 +18,20 @@ from pathlib import Path
 import pytest
 
 from wiki_translation_harness.cache import TranslationCache, compute_key
-from wiki_translation_harness.models import Chunk, Config, RunStats
+from wiki_translation_harness.models import Chunk, Config, RunStats, ValidationIssue
 from wiki_translation_harness.pipeline import (
     collapse_duplicate_list_defined_refs,
     drop_stray_reference_lists,
     extend_references_block_over_trailing_defs,
     merge_split_references_blocks,
     restore_orphaned_ref_definitions,
+    drop_unsupported_ref_reuses,
+    collapse_conflicting_ref_definitions,
     restore_ref_group_names,
     restore_ref_names,
     run_assembly_repair,
     run_review_pass,
+    _consistency_directives,
 )
 from wiki_translation_harness.skill_loader import SkillContent
 from wiki_translation_harness.verification import VerifiedFacts
@@ -96,6 +99,7 @@ def _chunk(text: str, order: int = 0) -> Chunk:
 class _FakeSource:
     title = "Test Article"
     wikitext = "English source text."
+    source_lang = "en"
 
 
 @pytest.mark.asyncio
@@ -433,6 +437,60 @@ async def test_review_pass_structural_safety_net_catches_review_driven_regressio
     assert issues == []
     assert rounds == 1
     assert "harvc" not in assembled
+
+
+@pytest.mark.asyncio
+async def test_review_pass_restores_last_clean_text_when_repair_leaves_a_structural_error():
+    # Regression (Religion): a review-driven rewrite left one more "}}" than
+    # "{{" and the article was saved with a flag.
+    chunk = _chunk("Parisi eshte {{lang|fr|Paris}} i madh.")
+    client = FakeOpenRouterClient(
+        [
+            '[{"kind": "grammar_case", "message": "Wrong case.", "snippet": "Parisi eshte"}]',
+            "Parisi është {{lang|fr|Paris i madh.",  # repair breaks the template
+            "[]",
+            "Parisi është {{lang|fr|Paris i madh!",  # structural repair fails too
+            "[]",
+        ]
+    )
+
+    assembled, issues, rounds, _ = await run_review_pass(
+        [chunk], _FakeSource(), _config(review_max_repair_attempts=2), "Parisi eshte {{lang|fr|Paris}} i madh.",
+        client, "review-model", _skill(), None, FakeMediaWikiClient(raise_if_called=True), RunStats(), VerifiedFacts(),
+    )
+
+    assert assembled == "Parisi eshte {{lang|fr|Paris}} i madh."
+    assert chunk.translated_text == "Parisi eshte {{lang|fr|Paris}} i madh."
+    assert [i.kind for i in issues] == ["grammar_case"]  # the unresolved review finding, not the break
+
+
+def test_consistency_directives_pick_the_most_used_form_for_every_chunk():
+    # Regression (Religion, Fundamentalism): the finding reached one chunk,
+    # whose model could not see the other spelling.
+    chunks = [
+        _chunk("Flavio Josefi shkroi. Flavio Josefi tha."),
+        _chunk("Flavius Jozefi u kthye."),
+        _chunk("Asgjë këtu."),
+    ]
+    for c in chunks:
+        c.translated_text = c.text
+    issue = ValidationIssue(
+        kind="entity_consistency",
+        message="Josephus is rendered as “Flavius Jozefi” here and “Flavio Josefi” later.",
+        severity="warning",
+    )
+    directives = _consistency_directives([issue], chunks)
+    assert list(directives) == [id(chunks[1])]
+    assert "use “Flavio Josefi”" in directives[id(chunks[1])][0]
+    assert "“Flavius Jozefi”" in directives[id(chunks[1])][0]
+
+
+def test_consistency_directives_ignore_other_kinds_and_forms_not_in_the_text():
+    chunks = [_chunk("Vetëm njëra formë: Jinnah.")]
+    chunks[0].translated_text = chunks[0].text
+    unrelated = ValidationIssue(kind="grammar_case", message="“Jinnah” and “Xhinah”", severity="warning")
+    one_form = ValidationIssue(kind="entity_consistency", message="“Jinnah” vs “Xhinah”", severity="warning")
+    assert _consistency_directives([unrelated, one_form], chunks) == {}
 
 
 @pytest.mark.asyncio
@@ -841,3 +899,35 @@ async def test_repair_chunk_discards_a_repair_that_drops_the_notelist():
         client, _skill(), "test-model", 0.0, "en", "sq", "Mars", "Notes", chunk, ["error: whatever"], None
     )
     assert result.text == chunk
+
+
+def test_drop_unsupported_ref_reuses_removes_invented_names_only():
+    # Regression (Sun): reuses of names the source never had and nothing defines.
+    source = '<ref name="A">a</ref> {{efn|name=heavy|x}}'
+    text = 'x<ref name="A" /><ref name="invented" />y<ref name=invented/><ref name="heavy" />'
+    patched, dropped = drop_unsupported_ref_reuses(text, source)
+    assert dropped == ["invented"]
+    assert patched == 'x<ref name="A" />y<ref name="heavy" />'
+
+
+def test_collapse_conflicting_ref_definitions_keeps_the_first():
+    # Regression (Sun): one source definition repeated, translated two ways.
+    source = '<ref name="short">All numbers are short scale.</ref> b <ref name="short">All numbers are short scale.</ref>'
+    text = '<ref name="short">Numrat janë shkalla e shkurtër.</ref> b <ref name="short">Numrat janë [[shkalla]].</ref>'
+    patched, collapsed = collapse_conflicting_ref_definitions(text, source)
+    assert collapsed == ["short"]
+    assert patched == '<ref name="short">Numrat janë shkalla e shkurtër.</ref> b <ref name="short" />'
+
+
+def test_collapse_conflicting_ref_definitions_keeps_the_group():
+    source = '<ref group=note name=s>One.</ref> <ref group=note name=s>One.</ref>'
+    text = '<ref group="note" name="s">Një.</ref> <ref group="note" name="s">Njëri.</ref>'
+    assert collapse_conflicting_ref_definitions(text, source)[0] == (
+        '<ref group="note" name="s">Një.</ref> <ref group="note" name="s" />'
+    )
+
+
+def test_collapse_conflicting_ref_definitions_leaves_genuinely_different_sources_alone():
+    source = '<ref name="x">one</ref> <ref name="x">two</ref>'
+    text = '<ref name="x">një</ref> <ref name="x">dy</ref>'
+    assert collapse_conflicting_ref_definitions(text, source) == (text, [])

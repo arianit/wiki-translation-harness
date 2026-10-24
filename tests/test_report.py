@@ -111,7 +111,7 @@ def test_attribution_block_matches_skill_worked_example():
         "{{Përkthyer nga|en|Archimedes|28 korrik 2026|1366588187}}\n\n"
         "== Përmbledhja e redaktimit ==\n"
         "Përkthyer nga anglishtja, sipas artikullit en:Archimedes, versioni i datës "
-        "28 korrik 2026 (revizioni 1366588187).\n"
+        "28 korrik 2026 (revizioni 1366588187)\n"
         "-->"
     )
 

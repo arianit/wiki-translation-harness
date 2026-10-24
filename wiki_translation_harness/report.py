@@ -55,7 +55,7 @@ def build_attribution_block(source: ArticleSource) -> str | None:
         f"{{{{Përkthyer nga|en|{source.title}|{albanian_date}|{source.revid}}}}}\n\n"
         "== Përmbledhja e redaktimit ==\n"
         f"Përkthyer nga anglishtja, sipas artikullit en:{source.title}, "
-        f"versioni i datës {albanian_date} (revizioni {source.revid}).\n"
+        f"versioni i datës {albanian_date} (revizioni {source.revid})\n"
         "-->"
     )
 
