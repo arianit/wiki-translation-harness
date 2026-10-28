@@ -7,15 +7,6 @@ Two artifacts, mirroring report.py's {title}.report.md convention:
   output_dir, atomic-written the same way statistics.py writes stats.json,
   so a batch runner (or a human) can query "what needs attention" without
   scanning individual .review.md files.
-
-Also, `record_review_flags`/`{title}.review-flags.md` — the non-blocking
-counterpart used by pipeline.run_review_pass (the semantic-fidelity review
-pass, see review.py) when it still has unresolved findings after its own
-repair-attempt cap. Unlike record_needs_human_review above, this does NOT
-withhold the `.wiki` file: a fidelity/grammar concern is a human spot-check
-prompt, not a publish blocker the way an unresolved structural defect is
-(this harness's output is always paste-ready wikitext for a human to review
-before it ever reaches the live wiki, never auto-published).
 """
 
 from __future__ import annotations
@@ -33,10 +24,6 @@ _INDEX_FILENAME = "needs_human_review.json"
 
 def review_path_for(output_dir: Path, title: str) -> Path:
     return output_dir / f"{sanitize_filename(title)}.review.md"
-
-
-def review_flags_path_for(output_dir: Path, title: str) -> Path:
-    return output_dir / f"{sanitize_filename(title)}.review-flags.md"
 
 
 def _index_path(output_dir: Path) -> Path:
@@ -106,36 +93,3 @@ def record_needs_human_review(
     _write_index(output_dir, entries)
 
     return review_path
-
-
-def _build_review_flags_markdown(title: str, issues: list[ValidationIssue], rounds: int) -> str:
-    lines = [
-        f"# Semantic review findings: {title}",
-        "",
-        f"Unresolved after {rounds} review-repair round(s). The `.wiki` file WAS saved — "
-        "these are unresolved translation-fidelity/grammar concerns, not structural "
-        "defects, so they don't block delivery. Spot-check before pasting to the live wiki.",
-        "",
-        "| severity | line | explanation | snippet |",
-        "|---|---|---|---|",
-    ]
-    for issue in issues:
-        finding = issue.as_finding()
-        line = finding["line_number"] if finding["line_number"] is not None else "?"
-        snippet = (finding["snippet"] or "").replace("|", "\\|").replace("\n", " ")
-        explanation = finding["explanation"].replace("|", "\\|")
-        lines.append(f"| {finding['severity']} | {line} | {explanation} | `{snippet}` |")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def record_review_flags(output_dir: Path, title: str, issues: list[ValidationIssue], rounds: int) -> Path:
-    """Non-blocking counterpart to record_needs_human_review — writes
-    {title}.review-flags.md but does not touch needs_human_review.json (that
-    index is reserved for the blocking structural case) and does not
-    prevent save_article from running. Returns the .review-flags.md path."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    text = _build_review_flags_markdown(title, issues, rounds)
-    path = review_flags_path_for(output_dir, title)
-    path.write_text(text, encoding="utf-8")
-    return path

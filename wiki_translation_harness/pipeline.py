@@ -24,6 +24,7 @@ from wiki_translation_harness.config import (
     resolve_review_provider,
 )
 from wiki_translation_harness.engines import LLMEngineClient, build_client_pool, build_llm_client
+from wiki_translation_harness.glossary import build_article_glossary
 from wiki_translation_harness.comments import reconcile_chunk_comments
 from wiki_translation_harness.citation_language import (
     dedupe_short_footnotes,
@@ -37,6 +38,12 @@ from wiki_translation_harness.citation_language import (
 from wiki_translation_harness.report import build_attribution_block
 from wiki_translation_harness.live_validator import validate_wikitext_live
 from wiki_translation_harness.mediawiki import MediaWikiClient, MediaWikiClientPool
+from wiki_translation_harness.layout_fixes import (
+    blank_line_before_headings,
+    fix_archive_dates,
+    replace_missing_excerpts,
+    unnest_ill_in_wikilinks,
+)
 from wiki_translation_harness.hatnote_ill import add_ill_to_hatnotes
 from wiki_translation_harness.ref_template import expand_r_definitions
 from wiki_translation_harness.notes import (
@@ -74,13 +81,19 @@ from wiki_translation_harness.qa import run_qa_checks
 from wiki_translation_harness.report import ArticleReportData, build_article_report, save_report
 from wiki_translation_harness.repair import repair_chunk, repair_chunk_semantic
 from wiki_translation_harness.review import review_article
-from wiki_translation_harness.review_queue import record_needs_human_review, record_review_flags
+from wiki_translation_harness.review_queue import record_needs_human_review
 from wiki_translation_harness.skill_loader import SkillContent, load_skill
+from wiki_translation_harness.source_templates import expand_italian_data_templates
 from wiki_translation_harness.sources import ArticleInput, load_article_source
 from wiki_translation_harness.statistics import StatsTracker
 from wiki_translation_harness.translator import translate_chunk
 from wiki_translation_harness.validator import format_errors, validate_wikitext
-from wiki_translation_harness.verification import VerifiedFacts, build_verified_facts_block, verify_wikitext
+from wiki_translation_harness.verification import (
+    VerifiedFacts,
+    build_verified_facts_block,
+    existing_article_matches_by_length,
+    verify_wikitext,
+)
 
 logger = logging.getLogger("wiki_translation_harness.pipeline")
 
@@ -855,6 +868,32 @@ async def post_process_assembled(
         except Exception as exc:
             logger.warning("Hatnote {{ill}} fix failed for %r: %s", source_title, exc)
 
+    if target_mw_client is not None:
+        try:
+            text, missing_excerpts = await replace_missing_excerpts(
+                text, target_mw_client.existing_pages, source_text, source_lang
+            )
+            if missing_excerpts:
+                logger.warning(
+                    "Replaced %d {{Excerpt}} with a missing target by an {{ill}} hatnote in %r: %s",
+                    len(missing_excerpts), source_title, missing_excerpts,
+                )
+        except Exception as exc:
+            logger.warning("Excerpt target check failed for %r: %s", source_title, exc)
+
+    text, unnested = unnest_ill_in_wikilinks(text)
+    if unnested:
+        logger.info("Unnested %d {{ill}} from inside a wikilink in %r", unnested, source_title)
+    try:
+        text, dates_fixed = fix_archive_dates(text)
+        if dates_fixed:
+            logger.info("Fixed %d |archive-date= value(s) in %r", dates_fixed, source_title)
+    except Exception as exc:
+        logger.warning("archive-date fix failed for %r: %s", source_title, exc)
+    text, headings_spaced = blank_line_before_headings(text)
+    if headings_spaced:
+        logger.info("Added a blank line before %d heading(s) in %r", headings_spaced, source_title)
+
     text, merged_refs_blocks = merge_split_references_blocks(text)
     if merged_refs_blocks:
         logger.info(
@@ -1218,7 +1257,7 @@ async def run_review_pass(
     Returns (assembled_text, remaining_issues, rounds_used,
     removed_comments) — remaining_issues is empty iff the review pass converged (no findings, or every finding
     got resolved within the round cap); a non-empty result does NOT mean
-    the caller should withhold the article (see review_queue.record_review_flags)."""
+    the caller should withhold the article (see report.build_review_section)."""
 
     async def _run_review_call(assembled_text: str) -> list[ValidationIssue]:
         findings, result = await review_article(
@@ -1408,6 +1447,20 @@ async def _plan_article(
         except Exception as exc:
             logger.warning("Cref2 note expansion failed for %r: %s", item.title, exc)
 
+        if effective_lang == "it":
+            try:
+                data_result = await expand_italian_data_templates(source.wikitext, source.title, mw_client)
+                if data_result.wikitext != source.wikitext:
+                    source = source.model_copy(update={"wikitext": data_result.wikitext})
+                    logger.info(
+                        "Expanded itwiki data templates in %r: %d population, %d demography table(s), "
+                        "%d infobox(es)%s",
+                        source.title, data_result.population, data_result.demography, data_result.infobox,
+                        f"; left {data_result.skipped} it could not expand" if data_result.skipped else "",
+                    )
+            except Exception as exc:
+                logger.warning("itwiki data-template expansion failed for %r: %s", item.title, exc)
+
         facts = VerifiedFacts()
         if wikidata_client is not None:
             try:
@@ -1540,6 +1593,18 @@ async def run_pipeline(
             if plan is None:
                 stats.articles_failed += 1
                 stats.article_results[item.title] = "failed"
+                continue
+            source, chunks, facts = plan
+            if existing_article_matches_by_length(source.wikitext, facts):
+                stats.articles_skipped += 1
+                stats.article_results[item.title] = "skipped"
+                logger.info(
+                    "Skipping %r: target article %r already exists and is similar in size (%d vs %d bytes)",
+                    item.title,
+                    facts.existing_target_title,
+                    len(source.wikitext.encode("utf-8")),
+                    facts.existing_target_bytes,
+                )
                 continue
             article_plans.append(plan)
 
@@ -1800,6 +1865,14 @@ async def run_pipeline(
                     stats_tracker.write(config.stats_path)
                     save_partial_article(config.partial_output_dir, source.title, chunks)
 
+            if config.glossary and len(chunks) > 1 and any(c.status == ChunkStatus.PENDING for c in chunks):
+                try:
+                    await build_article_glossary(
+                        chunks, facts, config, llm_client, config.model, skill, cache, pricing, stats, on_retry
+                    )
+                except Exception as exc:
+                    logger.warning("Glossary for %r failed, translating without it: %s", source.title, exc)
+
             # Execute chunk translation with overall article timeout
             try:
                 await asyncio.wait_for(
@@ -1905,17 +1978,13 @@ async def run_pipeline(
                 review_rounds = 0
             flagged = warning_findings + review_findings
             if flagged:
-                flags_path = record_review_flags(
-                    config.output_dir, source.title, flagged, rounds_used + review_rounds
-                )
                 logger.warning(
                     "Article %r has %d unresolved finding(s) (%d warning(s) left after assembly repair, "
-                    "%d from the semantic review) — flagged at %s, saved anyway: %s",
+                    "%d from the semantic review) — saved anyway: %s",
                     source.title,
                     len(flagged),
                     len(warning_findings),
                     len(review_findings),
-                    flags_path,
                     "; ".join(f"{i.kind}: {i.message}" for i in flagged),
                 )
 

@@ -182,7 +182,7 @@ def main(
         None,
         "--save-warnings/--no-save-warnings",
         help="Save an article whose only remaining findings are warnings (e.g. a template missing on the "
-        "target wiki), writing them to {title}.review-flags.md, instead of sending it to needs_human_review",
+        "target wiki), logging them, instead of sending it to needs_human_review",
     ),
     config_path: Path = typer.Option(Path("config.yaml"), "--config", help="Path to config.yaml"),
     force: bool = typer.Option(False, "--force", help="Re-translate even if output .wiki already exists"),

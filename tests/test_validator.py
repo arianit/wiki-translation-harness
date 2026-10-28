@@ -228,3 +228,17 @@ def test_unmatched_ref_reports_owning_line():
     issue = next(i for i in result.issues if i.kind == 'reference')
     assert issue.line_number == 2
     assert issue.snippet == '</ref>'
+
+
+def test_table_header_line_split_on_double_pipe_is_not_a_span_mismatch():
+    text = (
+        '{| class="wikitable"\n'
+        "! Emri italisht || Emri shqip || Banorë\n"
+        "|-\n"
+        "| A || B || 1\n"
+        "|-\n"
+        "| C || D || 2\n"
+        "|}\n"
+    )
+    result = validate_wikitext(text)
+    assert not [i for i in result.issues if i.kind == "table_span_mismatch"]

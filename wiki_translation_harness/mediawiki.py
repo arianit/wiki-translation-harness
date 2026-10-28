@@ -162,6 +162,29 @@ class MediaWikiClient:
                 results[name] = title if pages.get(title) else None
         return results
 
+    async def expand_templates(self, text: str, title: str) -> str:
+        """Expands `text` on this wiki via action=expandtemplates, with `title`
+        as the page context (templates such as itwiki's {{Popolazione}} read
+        data keyed by the page they appear on). Source-side use only: lets
+        the pipeline turn a data template the translator cannot evaluate
+        into the text it produces."""
+        params = {
+            "action": "expandtemplates",
+            "text": text,
+            "title": title,
+            "prop": "wikitext",
+            "format": "json",
+            "formatversion": "2",
+        }
+        resp = await asyncio.wait_for(
+            self._client.post(self.api_url, data=params), timeout=self._hard_timeout
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise MediaWikiError(f"action=expandtemplates failed for title {title!r}: {data['error']}")
+        return data.get("expandtemplates", {}).get("wikitext", "")
+
     async def existing_pages(self, titles: list[str]) -> dict[str, bool]:
         """Title -> whether a page of that title exists, following redirects.
         A "#section" suffix is ignored."""

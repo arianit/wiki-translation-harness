@@ -222,7 +222,7 @@ class RunStats(BaseModel):
     review_findings_total: int = 0
     # Separate from articles_needs_human_review: an article whose review
     # pass still had unresolved findings after review_max_repair_attempts,
-    # but was saved anyway (see review_queue.record_review_flags) rather
+    # but was saved anyway (see report.build_review_section) rather
     # than withheld -- a fidelity concern is a spot-check prompt, not a
     # publish blocker.
     articles_flagged_by_review: int = 0
@@ -344,11 +344,15 @@ class Config(BaseModel):
     review_provider: str | None = None
     # Repair-round budget for the review pass, mirroring
     # max_repair_attempts/max_assembly_repair_rounds. Unresolved findings
-    # after this cap do NOT block delivery (see review_queue.record_review_flags)
-    # — the article is still saved, with a companion flagged-addendum file,
+    # after this cap do NOT block delivery (see report.build_review_section)
+    # — the article is still saved, with the findings logged,
     # since a fidelity concern is a human spot-check prompt, not a publish
     # blocker the way an unresolved structural defect is.
     review_max_repair_attempts: int = 2
+    # Fix one rendering per recurring name before the chunks are translated in
+    # parallel (see glossary.py); the review pass otherwise flags the
+    # inconsistencies as entity_consistency findings.
+    glossary: bool = True
     workers: int = 4
     # Process articles one at a time (still using up to `workers` concurrent
     # chunk translations within each article) instead of starting every
@@ -380,7 +384,7 @@ class Config(BaseModel):
     # the article to needs_human_review and nothing is saved. On: an article
     # whose only remaining findings are warnings (a source template or Lua
     # module that doesn't exist on the target wiki) is saved anyway, with
-    # the findings written to {title}.review-flags.md.
+    # the findings logged.
     save_with_warnings: bool = False
     # Chunks repaired at once within one assembly-repair round. A round on
     # a long article can touch ~20 chunks; repaired one at a time that is
@@ -455,7 +459,7 @@ class Config(BaseModel):
     # request as pre-checked facts instead of the model having to guess.
     verify_links: bool = True
     verification_db_path: Path = Path("cache") / "verified_facts.sqlite3"
-    generate_reports: bool = True
+    generate_reports: bool = False
     # Wikidata/target-wiki lookups should complete in a few seconds — this
     # is deliberately its own (short) setting, not request_timeout_s, which
     # is sized for slow LLM completions and would let a single hung lookup

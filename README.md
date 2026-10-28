@@ -89,8 +89,7 @@ wiki-translation-harness --title "Dresnik archaeological site"
 ```
 
 When it finishes you get `Dresnik_archaeological_site.wiki` (the Albanian wikitext,
-ready to paste into sq.wikipedia) and `Dresnik_archaeological_site.report.md` (what
-was checked and what to review) in the output folder (see **Output**).
+ready to paste into sq.wikipedia) in the output folder (see **Output**).
 
 If the article has a line in the shared queue (see **Queue mode**), the run
 also marks it `DONE` or `FAILED` there, with the engine that produced it, and
@@ -190,12 +189,10 @@ Written to `output_dir` (default `~/code/wiki-translation-queue/output`;
 set it to `output` for a local folder):
 
 - `Article_Name.wiki`: the translated wikitext.
-- `Article_Name.report.md`: link/template verification tables, infobox
+- `Article_Name.report.md` (only with `generate_reports: true`): link/template verification tables, infobox
   parameters, citation languages, which sections needed repair, a REWRITE
   flag if the target article already exists, and (for English sources) a
   ready-to-paste `{{Përkthyer nga}}` Talk-page block and edit summary.
-- `Article_Name.review-flags.md`: only if the semantic review pass left
-  unresolved findings (see **Model tiers**).
 - `needs_human_review.json`: articles withheld because a structural defect
   could not be repaired.
 
@@ -296,7 +293,7 @@ All optional. With none set, one model does everything.
   errors, and inconsistent names across sections. Findings are repaired up
   to `review_max_repair_attempts` times. Unlike structural defects,
   unresolved review findings do **not** block the output; they go into
-  `.review-flags.md` and the report.
+  the log.
 
 `review_model` defaults to `complex_model`, so setting a stronger complex
 model also turns on review. Providers inherit the same way (review →

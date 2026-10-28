@@ -10,6 +10,7 @@ from wiki_translation_harness.verification import (
     VerifiedFacts,
     WikidataVerifier,
     build_verified_facts_block,
+    existing_article_matches_by_length,
     extract_link_targets,
     extract_template_names,
     verify_wikitext,
@@ -28,6 +29,16 @@ def test_extract_template_names_excludes_parser_functions():
     names = extract_template_names(text)
     assert "#if" not in names
     assert "PAGENAME" in names
+
+
+def test_existing_article_matches_by_length_allows_language_size_difference():
+    facts = VerifiedFacts(existing_target_title="Fëmija", existing_target_bytes=1300)
+    assert existing_article_matches_by_length("x" * 1000, facts)
+    assert not existing_article_matches_by_length("x" * 1000, VerifiedFacts())
+    assert not existing_article_matches_by_length(
+        "x" * 1000,
+        VerifiedFacts(existing_target_title="Fëmija", existing_target_bytes=1601),
+    )
 
 
 @pytest.mark.asyncio

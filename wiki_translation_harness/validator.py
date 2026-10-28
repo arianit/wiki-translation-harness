@@ -329,7 +329,7 @@ def _parse_table_rows(block: str) -> list[tuple[int, list[tuple[int, int]]]] | N
             in_row = False
         elif in_row and stripped and not stripped.startswith("|+"):
             if stripped.startswith("!"):
-                segments = re.split(r"!!", stripped[1:])
+                segments = re.split(r"!!|\|\|", stripped[1:])
             elif stripped.startswith("|"):
                 segments = re.split(r"\|\|", stripped[1:])
             else:

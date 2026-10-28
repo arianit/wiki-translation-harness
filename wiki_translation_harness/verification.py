@@ -31,6 +31,11 @@ WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 _INFOBOX_NAME_RE = re.compile(r"^infobox\b", re.IGNORECASE)
 _MAX_TEMPLATE_PARAMS_REPORTED = 60
 _MAX_SIBLING_LINKS_REPORTED = 80
+# Wikitext length varies between languages, but an existing target article in
+# this band is usually the already-translated article rather than a coincidental
+# same-title page.  The check is deliberately broad to avoid false negatives.
+_SAME_ARTICLE_MIN_RATIO = 0.65
+_SAME_ARTICLE_MAX_RATIO = 1.50
 # Hard, independent backstop for every individual Wikidata call — httpx's
 # own `timeout=` on the client has been confirmed, twice, to not reliably
 # fire under real network conditions. Generous enough to never trip on a
@@ -313,6 +318,7 @@ class VerifiedFacts:
     # is a rewrite, not a first translation (see the skill's own "Check
     # whether the sq article already exists" section).
     existing_target_title: str | None = None
+    existing_target_bytes: int | None = None
     # That existing article's own outgoing wikilink targets — already in
     # the target wiki's established form for this exact topic cluster, so
     # real terminology/naming to reuse rather than re-decide from scratch.
@@ -333,6 +339,9 @@ class VerifiedFacts:
     # source title, mutated in place as chunks complete so later chunks
     # (dispatched after an earlier one frees a worker slot) benefit from it.
     established_renderings: dict[str, str] = field(default_factory=dict)
+    # Source term -> the one rendering every chunk must use, fixed before
+    # translation starts (see glossary.build_article_glossary).
+    glossary: dict[str, str] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not self.links and not self.templates and not self.existing_target_title
@@ -345,6 +354,22 @@ class VerifiedFacts:
         only ever states what already exists."""
         for title, display in _extract_ill_renderings(translated_text).items():
             self.established_renderings.setdefault(title, display)
+
+
+def existing_article_matches_by_length(source_wikitext: str, facts: VerifiedFacts) -> bool:
+    """Return whether an existing target article is plausibly this article.
+
+    This is a conservative duplicate guard, not a semantic comparison: it is
+    only used when the target page is already identified by a Wikidata sitelink
+    or a direct target-wiki title/redirect lookup.
+    """
+    if facts.existing_target_title is None or facts.existing_target_bytes is None:
+        return False
+    source_bytes = len(source_wikitext.encode("utf-8"))
+    if source_bytes == 0:
+        return False
+    ratio = facts.existing_target_bytes / source_bytes
+    return _SAME_ARTICLE_MIN_RATIO <= ratio <= _SAME_ARTICLE_MAX_RATIO
 
 
 async def _resolve_cached_then_live(
@@ -374,30 +399,41 @@ async def _check_existing_article(
     verifier: WikidataVerifier,
     target_mw_client: MediaWikiClient | None,
     cache: VerificationCache | None,
-) -> tuple[str | None, list[str]]:
+) -> tuple[str | None, list[str], int | None]:
     """Checks whether the article itself already has a target-wiki sitelink
     (a rewrite, not a first translation — see the skill's "Check whether the
     sq article already exists" section) and, if so, fetches that existing
     article's own wikilinks: real, already-established target-wiki
     terminology for this exact topic, not a guess."""
-    if cache is not None:
-        cached = cache.get_sibling_links(source_lang, target_lang, article_title)
-        if cached is not None:
-            return cached
+    cached = cache.get_sibling_links(source_lang, target_lang, article_title) if cache is not None else None
+    if cached is not None:
+        existing_target_title, sibling_links = cached
+    else:
+        existing_target_title = (await verifier.check_sitelinks([article_title])).get(article_title)
+        sibling_links = []
 
-    existing_target_title = (await verifier.check_sitelinks([article_title])).get(article_title)
+    # Wikidata sitelinks are not complete.  Check the target wiki directly as
+    # well, following redirects, so an existing same-title article is caught
+    # even when its Wikidata item is missing or incomplete.
+    if target_mw_client is not None:
+        try:
+            direct_target = await target_mw_client.fetch_article(article_title)
+            existing_target_title = direct_target.title
+        except MediaWikiError:
+            pass
 
-    sibling_links: list[str] = []
+    existing_target_bytes: int | None = None
     if existing_target_title and target_mw_client is not None:
         try:
             existing_source = await target_mw_client.fetch_article(existing_target_title)
+            existing_target_bytes = len(existing_source.wikitext.encode("utf-8"))
             sibling_links = extract_link_targets(existing_source.wikitext)[:_MAX_SIBLING_LINKS_REPORTED]
         except MediaWikiError:
             pass
 
     if cache is not None:
         cache.set_sibling_links(source_lang, target_lang, article_title, existing_target_title, sibling_links)
-    return existing_target_title, sibling_links
+    return existing_target_title, sibling_links, existing_target_bytes
 
 
 async def verify_wikitext(
@@ -436,7 +472,7 @@ async def verify_wikitext(
             logger.warning("Target-wiki template lookup failed for %r: %s", article_title, exc)
             on_target = {}
         templates.update({name: target for name, target in on_target.items() if target})
-    existing_target_title, sibling_links = await _check_existing_article(
+    existing_target_title, sibling_links, existing_target_bytes = await _check_existing_article(
         article_title, source_lang, target_lang, verifier, target_mw_client, cache
     )
 
@@ -483,6 +519,7 @@ async def verify_wikitext(
         templates=templates,
         template_params=template_params,
         existing_target_title=existing_target_title,
+        existing_target_bytes=existing_target_bytes,
         sibling_links=sibling_links,
         not_found_link_language_counts=not_found_counts,
     )
@@ -564,6 +601,14 @@ def build_verified_facts_block(chunk_text: str, facts: VerifiedFacts) -> str:
 
     if has_citation_template:
         parts.append(_CITATION_PARAM_NAMES_NOTE)
+
+    glossary_block = [f"- {term} -> {rendering}" for term, rendering in facts.glossary.items() if term in chunk_text]
+    if glossary_block:
+        parts.append(
+            "Article glossary (names that recur across this article's sections; the rendering "
+            "is fixed — use exactly this spelling every time, adding only grammatical endings):\n"
+            + "\n".join(glossary_block)
+        )
 
     if not link_lines and not template_lines and not parts:
         return ""

@@ -27,7 +27,6 @@ from wiki_translation_harness.mediawiki import MediaWikiClientPool
 from wiki_translation_harness.models import Chunk, ChunkStatus, Config, ValidationIssue
 from wiki_translation_harness.output import output_path_for
 from wiki_translation_harness.report import build_review_section
-from wiki_translation_harness.review_queue import record_review_flags, review_flags_path_for
 from wiki_translation_harness.skill_loader import load_skill
 from wiki_translation_harness.sources import ArticleInput
 from wiki_translation_harness.statistics import StatsTracker
@@ -199,11 +198,6 @@ async def rereview_articles(
                 if not backup.exists():  # keep the very first draft if reviewed twice
                     backup.write_text(original, encoding="utf-8")
                 path.write_text(f"{assembled}{attribution}", encoding="utf-8")
-            flags_path = review_flags_path_for(config.output_dir, title)
-            if findings:
-                record_review_flags(config.output_dir, title, findings, rounds)
-            else:
-                flags_path.unlink(missing_ok=True)
             _update_report(path.with_suffix(".report.md"), review_model, findings)
             stats.articles_completed += 1
             results.append(result)
