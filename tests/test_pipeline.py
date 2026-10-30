@@ -20,6 +20,11 @@ import pytest
 from wiki_translation_harness.cache import TranslationCache, compute_key
 from wiki_translation_harness.models import Chunk, Config, RunStats, ValidationIssue
 from wiki_translation_harness.pipeline import (
+    run_assembly_repair,
+    run_review_pass,
+    _consistency_directives,
+)
+from wiki_translation_harness.reference_fixes import (
     collapse_duplicate_list_defined_refs,
     drop_stray_reference_lists,
     extend_references_block_over_trailing_defs,
@@ -29,9 +34,6 @@ from wiki_translation_harness.pipeline import (
     collapse_conflicting_ref_definitions,
     restore_ref_group_names,
     restore_ref_names,
-    run_assembly_repair,
-    run_review_pass,
-    _consistency_directives,
 )
 from wiki_translation_harness.skill_loader import SkillContent
 from wiki_translation_harness.verification import VerifiedFacts
