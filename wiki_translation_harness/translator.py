@@ -135,6 +135,23 @@ class ChunkOutcome:
     latency_s: float = 0.0
 
 
+def is_complex_routed(config: Config, chunk: Chunk) -> bool:
+    """Hybrid-model routing: complex chunks go to the complex tier
+    (config.complex_model) when one is configured."""
+    return bool(config.complex_model) and chunk.is_complex
+
+
+def translation_model(config: Config, chunk: Chunk) -> str:
+    """The model translate_chunk sends this chunk to."""
+    return config.complex_model if is_complex_routed(config, chunk) else config.model
+
+
+def chunk_cache_key(model: str, target_lang: str, chunk: Chunk, skill: SkillContent, facts_block: str) -> str:
+    """The translation-cache key translate_chunk stores this chunk under."""
+    facts_hash = hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
+    return compute_key(model, chunk.source_lang, target_lang, chunk.text, skill.content_hash, facts_hash)
+
+
 async def translate_chunk(
     chunk: Chunk,
     config: Config,
@@ -157,16 +174,14 @@ async def translate_chunk(
     # Hybrid-model routing: complex chunks use complex_model (and, when the
     # caller passed one, a distinct complex_client -- see
     # engines.build_client_pool/config.resolve_complex_provider) when configured.
-    is_complex_routed = bool(config.complex_model) and chunk.is_complex
-    effective_model = config.complex_model if is_complex_routed else config.model
-    effective_pricing = complex_pricing if is_complex_routed else pricing
-    effective_client = complex_client if (is_complex_routed and complex_client is not None) else client
+    complex_routed = is_complex_routed(config, chunk)
+    effective_model = translation_model(config, chunk)
+    effective_pricing = complex_pricing if complex_routed else pricing
+    effective_client = complex_client if (complex_routed and complex_client is not None) else client
     facts_block = build_verified_facts_block(chunk.text, verified_facts) if verified_facts else ""
-    facts_hash = hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
 
-    key = compute_key(
-        effective_model, chunk.source_lang, config.target_lang, chunk.text, skill.content_hash, facts_hash
-    )
+    key = chunk_cache_key(effective_model, config.target_lang, chunk, skill, facts_block)
+    chunk.cache_key = key
 
     cached_text = cache.get(key) if cache is not None else None
     if cached_text is not None:

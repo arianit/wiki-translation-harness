@@ -17,6 +17,7 @@ call can act on.
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from wiki_translation_harness.engines import LLMEngineClient
@@ -65,6 +66,8 @@ If the translation has no defects worth reporting, respond with an empty array:
 []
 ```
 """
+
+logger = logging.getLogger(__name__)
 
 _VALID_REVIEW_KINDS = frozenset(
     {"semantic_fidelity", "grammar_case", "entity_consistency", "infobox_param_mismatch"}
@@ -128,6 +131,11 @@ def _extract_json_array(text: str) -> list | None:
 
 def parse_review_findings(text: str) -> list[ValidationIssue]:
     data = _extract_json_array(text)
+    if data is None:
+        # Indistinguishable from a clean review to the caller, so at least
+        # leave a trail: the article was not actually reviewed.
+        logger.warning("Review response had no parseable JSON findings array: %r", text[:300])
+        return []
     if not data:
         return []
     issues: list[ValidationIssue] = []

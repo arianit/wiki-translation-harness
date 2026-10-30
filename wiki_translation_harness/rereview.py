@@ -28,7 +28,7 @@ from wiki_translation_harness.models import Chunk, ChunkStatus, Config, Validati
 from wiki_translation_harness.output import output_path_for
 from wiki_translation_harness.report import build_review_section
 from wiki_translation_harness.skill_loader import load_skill
-from wiki_translation_harness.sources import ArticleInput
+from wiki_translation_harness.sources import ArticleInput, parse_source_ref
 from wiki_translation_harness.statistics import StatsTracker
 from wiki_translation_harness.cache import VerificationCache
 
@@ -162,7 +162,11 @@ async def rereview_articles(
         target_mw_client = mw_pool.get(config.target_lang)
 
         for title in titles:
-            path = output_path_for(config.output_dir, title)
+            # A title may carry its source wiki (`it:Title`, as the CLI passes
+            # queue lines); the bare title names the saved file.
+            ref_lang, name = parse_source_ref(title)
+            source_lang = ref_lang or config.source_lang
+            path = output_path_for(config.output_dir, name)
             if not path.exists():
                 logger.error("No saved translation for %r at %s", title, path)
                 continue
@@ -174,13 +178,13 @@ async def rereview_articles(
 
             try:
                 plan = await _plan_article(
-                    mw_pool, ArticleInput(title=title, source_lang=config.source_lang, revid=revid),
+                    mw_pool, ArticleInput(title=name, source_lang=source_lang, revid=revid),
                     config, fetch_sem, wikidata_client, verification_cache,
                 )
                 if plan is None:
                     continue
                 source, _, facts = plan
-                chunks = split_into_stand_in_chunks(source.title, body, config.source_lang)
+                chunks = split_into_stand_in_chunks(source.title, body, source_lang)
                 logger.info("Reviewing %r (%d section(s)) with %s", title, len(chunks), review_model)
                 assembled, findings, rounds, _ = await run_review_pass(
                     chunks, source, config, body, review_client, review_model, skill, review_pricing,

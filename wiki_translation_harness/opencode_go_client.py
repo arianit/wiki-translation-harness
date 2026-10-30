@@ -60,25 +60,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from wiki_translation_harness.models import EngineError, InsufficientCreditsError, ModelPricing
-from wiki_translation_harness.openrouter import RetryCallback
-
-# Substrings looked for (case-insensitively) in a failed call's error message
-# to recognize an account/session-level usage limit -- as opposed to a
-# transient failure worth retrying. Deliberately broad/lowercase-matched:
-# the one real error this session could trigger live (an unrecognized
-# model id) came back as a generic "Unexpected server error" with no
-# specific code to branch on instead, so a genuine rate/quota rejection's
-# exact wording remains unconfirmed -- keep these broad rather than
-# over-fitting to a guess.
-_SESSION_LIMIT_MARKERS = (
-    "rate limit",
-    "rate_limit",
-    "usage limit",
-    "quota",
-    "429",
-    "spend limit",
+from wiki_translation_harness.models import (
+    EngineError,
+    InsufficientCreditsError,
+    ModelPricing,
+    looks_like_usage_limit,
 )
+from wiki_translation_harness.openrouter import RetryCallback
 
 
 class OpenCodeGoError(EngineError):
@@ -299,7 +287,7 @@ class OpenCodeGoClient:
             if "opencode CLI not found" in result.stderr:
                 # A missing binary won't fix itself on retry.
                 raise OpenCodeGoError(result.stderr)
-            if any(marker in result.stderr.lower() for marker in _SESSION_LIMIT_MARKERS):
+            if looks_like_usage_limit(result.stderr):
                 # Same reasoning as claude_code_client's 429 handling: an
                 # account/session-level limit cannot be fixed by backing off
                 # within the same run, so fail fast rather than burn the

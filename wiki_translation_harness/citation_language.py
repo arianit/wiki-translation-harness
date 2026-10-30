@@ -28,7 +28,11 @@ from dataclasses import dataclass
 
 import httpx
 import mwparserfromhell as mwp
-from langdetect import LangDetectException, detect_langs
+from langdetect import DetectorFactory, LangDetectException, detect_langs
+
+# langdetect is randomized; without a fixed seed the same title can get a
+# different |language= on each run (and a different cache-busting article).
+DetectorFactory.seed = 0
 
 CITATION_TEMPLATE_NAMES = {
     "cite web",
@@ -255,7 +259,12 @@ async def fill_missing_citation_languages(
     never touches prose, only adds a missing |language= parameter."""
     code = mwp.parse(wikitext)
     templates = [t for t in code.filter_templates(recursive=True) if _is_citation_template(str(t.name))]
-    missing = [t for t in templates if not t.has("language", ignore_empty=True)]
+    # |lang= is CS1's alias for |language=: adding the other one as well makes
+    # CS1 report a duplicate parameter.
+    missing = [
+        t for t in templates
+        if not t.has("language", ignore_empty=True) and not t.has("lang", ignore_empty=True)
+    ]
 
     if not missing:
         return CitationLanguageResult(patched_wikitext=wikitext, filled={}, attempted=0, fetched_urls=0)

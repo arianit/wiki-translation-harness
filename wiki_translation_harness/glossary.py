@@ -12,7 +12,6 @@ hands each chunk the entries it contains.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 
@@ -111,7 +110,3 @@ async def build_article_glossary(
     facts.glossary = parse_glossary(reply, terms)
     logger.info("Glossary for %r: %d of %d recurring term(s)", article, len(facts.glossary), len(terms))
     return len(facts.glossary)
-
-
-def glossary_lines(chunk_text: str, glossary: dict[str, str]) -> list[str]:
-    return [f"- {term} -> {rendering}" for term, rendering in glossary.items() if term in chunk_text]

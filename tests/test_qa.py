@@ -67,3 +67,10 @@ def test_missing_reflist_is_anchored_to_the_last_line():
     (issue,) = [i for i in run_qa_checks(text) if i.kind == "qa_missing_reflist"]
     assert issue.line_number == text.count("\n") + 1
     assert "qa_missing_reflist" not in _kinds("No citations at all.")
+
+
+def test_empty_url_counts_as_missing():
+    with_url = CLEAN.replace("{{Reflist}}", "{{Reflist}}") + "<ref>{{cite web|url=https://y.org|title=Y|language=en}}</ref>"
+    empty = CLEAN + "<ref>{{cite web|url= |title=Y|language=en}}</ref>"
+    assert "qa_cite_web_no_url" not in _kinds(with_url)
+    assert "qa_cite_web_no_url" in _kinds(empty)

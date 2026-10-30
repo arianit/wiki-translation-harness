@@ -7,15 +7,13 @@ output.py. Contains no translation logic of its own.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import html
 import logging
 import re
-import time
 
 import httpx
 
-from wiki_translation_harness.cache import TranslationCache, VerificationCache, compute_key
+from wiki_translation_harness.cache import TranslationCache, VerificationCache
 from wiki_translation_harness.resume import checkpoint_input, input_key, record_attempt, unfinished_inputs
 from wiki_translation_harness.config import (
     default_model_for_provider,
@@ -46,13 +44,18 @@ from wiki_translation_harness.layout_fixes import (
 )
 from wiki_translation_harness.hatnote_ill import add_ill_to_hatnotes
 from wiki_translation_harness.ref_template import expand_r_definitions
-from wiki_translation_harness.notes import (
-    IMPLICIT_NOTE_GROUP,
-    NOTELIST_ALIASES,
-    expand_cref_notes,
-    normalize_notelist_aliases,
-    uses_implicit_note_group,
+from wiki_translation_harness.reference_fixes import (
+    collapse_conflicting_ref_definitions,
+    collapse_duplicate_list_defined_refs,
+    drop_stray_reference_lists,
+    drop_unsupported_ref_reuses,
+    extend_references_block_over_trailing_defs,
+    merge_split_references_blocks,
+    restore_orphaned_ref_definitions,
+    restore_ref_group_names,
+    restore_ref_names,
 )
+from wiki_translation_harness.notes import expand_cref_notes, normalize_notelist_aliases
 from wiki_translation_harness.models import (
     ArticleSource,
     Chunk,
@@ -62,6 +65,7 @@ from wiki_translation_harness.models import (
     InsufficientCreditsError,
     ModelPricing,
     RunStats,
+    TranslationResult,
     ValidationIssue,
 )
 from wiki_translation_harness.openrouter import RetryCallback
@@ -86,7 +90,12 @@ from wiki_translation_harness.skill_loader import SkillContent, load_skill
 from wiki_translation_harness.source_templates import expand_italian_data_templates
 from wiki_translation_harness.sources import ArticleInput, load_article_source
 from wiki_translation_harness.statistics import StatsTracker
-from wiki_translation_harness.translator import translate_chunk
+from wiki_translation_harness.translator import (
+    chunk_cache_key,
+    is_complex_routed,
+    translate_chunk,
+    translation_model,
+)
 from wiki_translation_harness.validator import format_errors, validate_wikitext
 from wiki_translation_harness.verification import (
     VerifiedFacts,
@@ -200,513 +209,6 @@ def normalize_quote_templates(text: str) -> str:
     trigger unexpanded template warnings if left unexpanded.
     """
     return _QUOTE_TEMPLATE_RE.sub(r"\g<1>", text)
-
-
-_REFERENCES_OPEN_RE = re.compile(r"<references\b[^>]*(?<!/)>", re.IGNORECASE)
-_REFERENCES_CLOSE = "</references>"
-_HEADING_LINE_RE = re.compile(r"^=+[^=].*=+\s*$")
-
-
-def merge_split_references_blocks(text: str) -> tuple[str, int]:
-    """Rejoin a list-defined `<references>` block that chunking split in two.
-
-    A long "Citations" section is cut mid-block, so the first chunk's
-    translation closes the `<references>` it opened and the second chunk
-    (which has no opener) ends with the source's original `</references>`.
-    Assembled, that is `<references> defs </references> more defs
-    </references>`: the defs after the first closer sit outside the block,
-    so Cite reports every ref used only by them as "no text given" and every
-    ref defined inside as "not used in preceding text" — dozens of
-    orphaned_named_ref findings that no per-chunk repair can fix, since each
-    chunk looks fine alone.
-
-    A closer with no matching opener is the second half's; the previous
-    closer (same section, nothing but ref definitions between) is the
-    spurious one and is dropped. Returns (patched_text, merged_count)."""
-    lines = text.split("\n")
-    is_open = False
-    last_close: int | None = None
-    drop: set[int] = set()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if _HEADING_LINE_RE.match(stripped):
-            last_close = None
-        elif _REFERENCES_OPEN_RE.search(stripped):
-            is_open = True
-            last_close = None
-        elif stripped.lower() == _REFERENCES_CLOSE:
-            if is_open:
-                is_open = False
-                last_close = i
-            elif last_close is not None:
-                drop.add(last_close)
-                last_close = None
-    if not drop:
-        return text, 0
-    return "\n".join(line for i, line in enumerate(lines) if i not in drop), len(drop)
-
-
-_GROUP_ATTR_RE = re.compile(
-    r"(\bgroup\s*=\s*)(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'/>|}]+))", re.IGNORECASE
-)
-
-
-def _group_value(match: re.Match[str]) -> str:
-    return next(g for g in match.groups()[1:] if g is not None).strip()
-
-
-def restore_ref_group_names(text: str, source_text: str) -> tuple[str, dict[str, str]]:
-    """Undo translation of a footnote group's name (group=note ->
-    group="shënim").
-
-    The group name never reaches the reader, but it has to match exactly:
-    the model translates it in some chunks and keeps it in others, so the
-    notes of a translated `<ref group="shënim">` find no list (the
-    `{{Reflist|group=note|refs=...}}` that kept its name) and the model
-    adds a `<references group="shënim"/>` of its own wherever it pleases.
-
-    A translation-only group maps back when there's no doubt which source
-    group it was: the source has just one group, or exactly one source
-    group went missing in translation as exactly one new one appeared.
-    Returns (patched_text, {translated_name: source_name})."""
-    source_groups = {_group_value(m) for m in _GROUP_ATTR_RE.finditer(source_text)}
-    # {{Efn}} and {{Notelist}} put their notes in lower-alpha when the source
-    # names no group, so that group exists in the source without being
-    # written there. The model then invents one for the {{Efn}} it turns into
-    # a <ref> (Mount Everest "note", Washington D.C. and Periodic table "sh"),
-    # and sqwiki's {{Listë shënimesh}} lists lower-alpha only.
-    if uses_implicit_note_group(source_text):
-        source_groups.add(IMPLICIT_NOTE_GROUP)
-    text_groups = {_group_value(m) for m in _GROUP_ATTR_RE.finditer(text)}
-    unknown = text_groups - source_groups
-    if not unknown:
-        return text, {}
-    if len(source_groups) == 1:
-        (target,) = source_groups
-        renamed = {name: target for name in unknown}
-    elif len(unknown) == 1 and len(source_groups - text_groups) == 1:
-        renamed = {next(iter(unknown)): next(iter(source_groups - text_groups))}
-    else:
-        return text, {}
-
-    def _rename(match: re.Match[str]) -> str:
-        name = _group_value(match)
-        if name not in renamed:
-            return match.group(0)
-        return f'{match.group(1)}"{renamed[name]}"'
-
-    return _GROUP_ATTR_RE.sub(_rename, text), renamed
-
-
-# A tag or template that renders a reference list and carries no
-# definitions of its own: `<references />`, an empty `<references></references>`,
-# or a one-line `{{Reflist}}`/`{{Notelist}}` without |refs=.
-_REF_LIST_RENDERER_RE = re.compile(
-    r"<references\b(?P<tag_attrs>[^>]*?)/>"
-    r"|<references\b(?P<pair_attrs>[^>]*)>\s*</references\s*>"
-    r"|\{\{\s*(?P<tpl>reflist|references|notelist|listë shënimesh"
-    + "".join("|" + re.escape(a).replace(r"\ ", r"\s+") for a in NOTELIST_ALIASES)
-    + r")\s*(?P<tpl_args>\|[^{}\n]*)?\}\}",
-    re.IGNORECASE,
-)
-
-
-def _ref_list_key(match: re.Match[str]) -> tuple[str, str] | None:
-    """(kind, group) of a reference-list renderer, or None if it's a
-    template that defines refs (|refs=), which is content, not a stray."""
-    tpl = match.group("tpl")
-    attrs = match.group("tag_attrs") or match.group("pair_attrs") or match.group("tpl_args") or ""
-    if tpl and re.search(r"\|\s*refs\s*=", attrs, re.IGNORECASE):
-        return None
-    group = _GROUP_ATTR_RE.search(attrs)
-    group_name = _group_value(group) if group else ""
-    if tpl and tpl.lower() not in ("reflist", "references"):
-        # A note list is a reflist for the group its notes are in, so the
-        # model writing {{Reflist|group=lower-alpha}} for {{notelist}}
-        # counts as the same list.
-        return "refs", group_name or IMPLICIT_NOTE_GROUP
-    return "refs", group_name
-
-
-_NOTES_HEADING_RE = re.compile(r"=+\s*(?:notes?|shënim\w*)\s*=+\s*", re.IGNORECASE)
-
-
-def _under_notes_heading(text: str, pos: int) -> bool:
-    """True when the last non-blank line before `pos` is a Notes/Shënime heading."""
-    for line in reversed(text[:pos].splitlines()):
-        if line.strip():
-            return _NOTES_HEADING_RE.fullmatch(line.strip()) is not None
-    return False
-
-
-def drop_stray_reference_lists(text: str, source_text: str) -> tuple[str, int]:
-    """Remove reference lists the model invented.
-
-    When chunking splits a long list-defined `<references>` block, the
-    model translating each later piece "completes" its fragment with a
-    `<references />` (or `<references group="..."/>`, or an empty
-    `<references></references>`) of its own — the Albert Einstein run had
-    nine where the source had one. Each one flushes the refs before it, so
-    the definitions after the first one land outside the real block and
-    Cite reports every ref used only by them as having no text. The same
-    habit drops `<references group="note" />` under random mid-article
-    headings.
-
-    For each (kind, group), keeps as many renderers as the source has
-    — one directly under a Notes heading first, then the last ones, since
-    reference lists close an article — and removes the rest, whole line
-    and all where the renderer stood alone.
-    Returns (patched_text, removed_count)."""
-    allowed: dict[tuple[str, str], int] = {}
-    for m in _REF_LIST_RENDERER_RE.finditer(source_text):
-        key = _ref_list_key(m)
-        if key is not None:
-            allowed[key] = allowed.get(key, 0) + 1
-
-    by_key: dict[tuple[str, str], list[re.Match[str]]] = {}
-    for m in _REF_LIST_RENDERER_RE.finditer(text):
-        key = _ref_list_key(m)
-        if key is not None:
-            by_key.setdefault(key, []).append(m)
-
-    spans: list[tuple[int, int]] = []
-    for key, matches in by_key.items():
-        excess = len(matches) - allowed.get(key, 0)
-        if excess > 0:
-            # A list directly under the Notes heading is where the source
-            # has it; the model's other copies are strays even when one of
-            # them is the last in the file.
-            kept = sorted(
-                range(len(matches)),
-                key=lambda i: (not _under_notes_heading(text, matches[i].start()), -i),
-            )[: len(matches) - excess]
-            removed = [matches[i] for i in range(len(matches)) if i not in kept]
-        else:
-            removed = []
-        for m in removed:
-            start, end = m.span()
-            line_start = text.rfind("\n", 0, start) + 1
-            line_end = text.find("\n", end)
-            line_end = len(text) if line_end == -1 else line_end
-            if not text[line_start:start].strip() and not text[end:line_end].strip():
-                start, end = line_start, min(line_end + 1, len(text))
-            spans.append((start, end))
-    if not spans:
-        return text, 0
-
-    parts: list[str] = []
-    pos = 0
-    for start, end in sorted(spans):
-        parts.append(text[pos:start])
-        pos = end
-    parts.append(text[pos:])
-    return "".join(parts), len(spans)
-
-
-_DEFS_AFTER_REFERENCES_RE = re.compile(
-    # HTML comments may sit between the definitions (the model leaves its
-    # own notes there); the run still has to end on a definition.
-    r"</references\s*>((?:(?:\s*<!--.*?-->)*\s*<ref\b[^>]*?(?<!/)>(?:(?!<ref\b).)*?</ref\s*>)+)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def extend_references_block_over_trailing_defs(text: str) -> tuple[str, int]:
-    """Move a `</references>` down past the ref definitions that directly
-    follow it.
-
-    The other half of merge_split_references_blocks: there the later
-    chunk kept the source's `</references>`; here the model dropped it (or
-    drop_stray_reference_lists removed the `<references />` it wrote
-    instead), so the block closes after the first chunk's definitions and
-    the rest trail after it, outside any list. A named definition right
-    after a reference list is never intended, so the run joins the block.
-    Returns (patched_text, moved_definition_count)."""
-    moved = 0
-
-    def _extend(match: re.Match[str]) -> str:
-        nonlocal moved
-        defs = match.group(1)
-        moved += len(re.findall(r"</ref\s*>", defs, re.IGNORECASE))
-        # lstrip: the newline after the old closer would otherwise leave a
-        # blank line where it stood.
-        return defs.lstrip() + "\n</references>"
-
-    return _DEFS_AFTER_REFERENCES_RE.sub(_extend, text), moved
-
-
-_REF_NAME_ATTR = r"\bname\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'/>]+))"
-_REF_SELF_CLOSING_RE = re.compile(r"<ref\b[^>]*?" + _REF_NAME_ATTR + r"[^>]*?/>", re.IGNORECASE)
-_REF_DEFINITION_RE = re.compile(
-    # The body may not run past another <ref opener: an unclosed definition
-    # (its </ref> lost in translation) would otherwise extend to the NEXT
-    # definition's </ref>, hiding that ref from `defined` — and
-    # restore_orphaned_ref_definitions would then add a duplicate
-    # definition of a ref that was there all along.
-    r"<ref\b[^>]*?" + _REF_NAME_ATTR + r"[^>]*?(?<!/)>((?:(?!<ref\b).)*?)</ref\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _ref_name(match: re.Match[str]) -> str:
-    return (match.group(1) or match.group(2) or match.group(3)).strip()
-
-
-_REFERENCES_BLOCK_RE = re.compile(r"<references\b[^>/]*>(.*?)</references\s*>", re.IGNORECASE | re.DOTALL)
-
-
-def _block_spans(text: str) -> list[tuple[int, int]]:
-    return [m.span() for m in _REFERENCES_BLOCK_RE.finditer(text)]
-
-
-def collapse_duplicate_list_defined_refs(text: str, source_text: str) -> tuple[str, list[str]]:
-    """Turn a body definition of a list-defined ref back into a plain reuse.
-
-    The source keeps these refs' text only inside the `<references>` block;
-    in the body they are `<ref name="x" />`. A chunk whose model "helpfully"
-    writes the full text at the first use (or whose definition
-    restore_orphaned_ref_definitions copied in from the source before the
-    block's own copy was in place) leaves two definitions — often worded
-    differently — and Cite reports the ref as defined multiple times with
-    different content. The block's copy wins: it is the source's.
-
-    Only names the source defines inside a block and nowhere else, and only
-    refs without a group. Returns (patched_text, collapsed_names)."""
-    def _names_in(block_texts: list[str]) -> set[str]:
-        return {_ref_name(m) for chunk in block_texts for m in _REF_DEFINITION_RE.finditer(chunk)}
-
-    source_blocks = _block_spans(source_text)
-    in_source_blocks = _names_in([source_text[a:b] for a, b in source_blocks])
-    source_outside = "".join(
-        source_text[start:end]
-        for start, end in _complement_spans(len(source_text), source_blocks)
-    )
-    list_defined = in_source_blocks - _names_in([source_outside])
-    blocks = _block_spans(text)
-    in_text_blocks = _names_in([text[a:b] for a, b in blocks])
-    targets = list_defined & in_text_blocks
-    if not targets:
-        return text, []
-
-    collapsed: list[str] = []
-    out: list[str] = []
-    for start, end in _complement_spans(len(text), blocks):
-        def _collapse(match: re.Match[str]) -> str:
-            name = _ref_name(match)
-            opening = match.group(0)[: match.group(0).index(">") + 1]
-            if name not in targets or re.search(r"\bgroup\s*=", opening, re.IGNORECASE):
-                return match.group(0)
-            collapsed.append(name)
-            return f'<ref name="{name}" />'
-
-        out.append((start, _REF_DEFINITION_RE.sub(_collapse, text[start:end])))
-    pieces = sorted(out + [(a, text[a:b]) for a, b in blocks])
-    return "".join(piece for _, piece in pieces), collapsed
-
-
-def _complement_spans(length: int, spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    result, pos = [], 0
-    for start, end in sorted(spans):
-        if start > pos:
-            result.append((pos, start))
-        pos = end
-    if pos < length:
-        result.append((pos, length))
-    return result
-
-
-def restore_orphaned_ref_definitions(text: str, source_text: str) -> tuple[str, list[str]]:
-    """Copy back named-ref definitions that translation dropped.
-
-    The model sometimes condenses away the sentence that carried a
-    `<ref name="x">...</ref>` definition while keeping a later
-    `<ref name="x" />` reuse — Cite then renders an orphaned-ref error.
-    Handing that to the LLM repair loop rarely works: the chunk that has
-    the reuse never saw the definition's content, so it either invents a
-    citation or does nothing, and the loop burns its rounds. The source
-    article still has the exact definition, so this rewrites the first
-    orphaned reuse into a full definition using the source's ref body
-    (citation bodies are kept untranslated anyway). Refs the source doesn't
-    define either are left for the repair loop.
-
-    Returns (patched_text, restored_names)."""
-    defined = {_ref_name(m) for m in _REF_DEFINITION_RE.finditer(text)}
-    source_defs: dict[str, str] = {}
-    for m in _REF_DEFINITION_RE.finditer(source_text):
-        source_defs.setdefault(_ref_name(m), m.group(4))
-
-    restored: list[str] = []
-
-    def _restore(match: re.Match[str]) -> str:
-        name = _ref_name(match)
-        if name in defined or name not in source_defs:
-            return match.group(0)
-        defined.add(name)
-        restored.append(name)
-        return f'<ref name="{name}">{source_defs[name]}</ref>'
-
-    return _REF_SELF_CLOSING_RE.sub(_restore, text), restored
-
-
-def drop_unsupported_ref_reuses(text: str, source_text: str) -> tuple[str, list[str]]:
-    """Remove `<ref name="x" />` reuses of a name that nothing defines.
-
-    The model sometimes invents a descriptive name for a citation
-    (`corona-particle-density`, `Sun-Rotation-rotation` on the Sun run) and
-    reuses it in several places without ever writing the definition. The
-    source has no such name, so restore_orphaned_ref_definitions has nothing
-    to copy back and the repair loop can only invent a citation; every use
-    is a Cite error. A name that appears nowhere in the source and is
-    defined nowhere in the translation is unsupported, so its reuses go.
-
-    Returns (patched_text, dropped_names)."""
-    defined = {_ref_name(m) for m in _REF_DEFINITION_RE.finditer(text)}
-    dropped: list[str] = []
-
-    def _drop(match: re.Match[str]) -> str:
-        name = _ref_name(match)
-        if name in defined or name in source_text:
-            return match.group(0)
-        if name not in dropped:
-            dropped.append(name)
-        return ""
-
-    return _REF_SELF_CLOSING_RE.sub(_drop, text), dropped
-
-
-def collapse_conflicting_ref_definitions(text: str, source_text: str) -> tuple[str, list[str]]:
-    """Turn the later definitions of a name into reuses when the model
-    translated identical source definitions differently.
-
-    A source may repeat `<ref name="short">All numbers ... short scale</ref>`
-    word for word in several sections (Sun does, twice). Each copy is
-    translated in its own chunk, the wording differs, and Cite reports the
-    name as defined multiple times with different content. Only names whose
-    source definitions all agree are touched; the first definition stays.
-
-    Returns (patched_text, collapsed_names)."""
-    def _squash(body: str) -> str:
-        return re.sub(r"\s+", " ", body).strip()
-
-    source_bodies: dict[str, set[str]] = {}
-    for m in _REF_DEFINITION_RE.finditer(source_text):
-        source_bodies.setdefault(_ref_name(m), set()).add(_squash(m.group(4)))
-
-    seen: dict[str, str] = {}
-    conflicting: set[str] = set()
-    for m in _REF_DEFINITION_RE.finditer(text):
-        name, body = _ref_name(m), _squash(m.group(4))
-        if name in seen and seen[name] != body and len(source_bodies.get(name, ())) == 1:
-            conflicting.add(name)
-        seen.setdefault(name, body)
-    if not conflicting:
-        return text, []
-
-    first: set[str] = set()
-    collapsed: list[str] = []
-
-    def _collapse(match: re.Match[str]) -> str:
-        name = _ref_name(match)
-        if name not in conflicting:
-            return match.group(0)
-        if name not in first:
-            first.add(name)
-            return match.group(0)
-        if name not in collapsed:
-            collapsed.append(name)
-        # Keep the opening tag's attributes: a reuse must name the same group.
-        opening = re.match(r"<ref\b[^>]*>", match.group(0)).group(0)
-        return opening[:-1].rstrip() + " />"
-
-    return _REF_DEFINITION_RE.sub(_collapse, text), collapsed
-
-
-_REF_TAG_RE = re.compile(
-    r"<ref\b(?P<attrs>[^>]*?)(?:/>|(?<!/)>(?P<body>(?:(?!<ref\b).)*?)</ref\s*>)",
-    re.IGNORECASE | re.DOTALL,
-)
-_REF_NAME_ATTR_RE = re.compile(_REF_NAME_ATTR.replace(r"\bname", r"\s*\bname", 1), re.IGNORECASE)
-_URL_RE = re.compile(r"https?://[^\s|}\]<]+")
-
-
-def _ref_fingerprint(body: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """URLs and digit runs of a ref body: what survives translation of a
-    citation (titles and month names change, addresses and numbers don't)."""
-    return tuple(_URL_RE.findall(body)), tuple(re.findall(r"\d+", _URL_RE.sub("", body)))
-
-
-def restore_ref_names(text: str, source_text: str) -> tuple[str, dict[str, list[str | None]]]:
-    """Undo the model renaming refs (`Brubaker et al-4` -> `Brubaker et-4`).
-
-    A ref name is an identifier, never prose, but the model sometimes
-    rewrites it, or names a ref the source left unnamed — and once several
-    different citations share one invented name Cite reports it as defined
-    multiple times with different content (Cluj-Napoca: seven Brubaker
-    citations under one name).
-
-    Only names the source never uses are touched. Each definition under such
-    a name is matched to the source definition with the same URLs and
-    numbers; it takes that definition's name, or loses its name when the
-    source ref was unnamed. A definition with no unambiguous match is left
-    alone. Reuses of the name follow only when its matched definitions
-    agree on exactly one source name.
-
-    Returns (patched_text, {translated_name: [restored names; None = unnamed]})."""
-    source_tags = list(_REF_TAG_RE.finditer(source_text))
-    source_names: set[str] = set()
-    by_fingerprint: dict[tuple, list[str | None]] = {}
-    for tag in source_tags:
-        name_match = _REF_NAME_ATTR_RE.search(tag.group("attrs"))
-        name = _ref_name(name_match) if name_match else None
-        if name:
-            source_names.add(name)
-        if tag.group("body") is not None:
-            by_fingerprint.setdefault(_ref_fingerprint(tag.group("body")), []).append(name)
-
-    tags = list(_REF_TAG_RE.finditer(text))
-    definition_targets: dict[int, str | None] = {}
-    named_targets: dict[str, set[str]] = {}
-    for index, tag in enumerate(tags):
-        name_match = _REF_NAME_ATTR_RE.search(tag.group("attrs"))
-        if not name_match or tag.group("body") is None:
-            continue
-        name = _ref_name(name_match)
-        if name in source_names:
-            continue
-        fingerprint = _ref_fingerprint(tag.group("body"))
-        candidates = by_fingerprint.get(fingerprint, []) if any(fingerprint) else []
-        if not candidates or len(set(candidates)) != 1:
-            continue
-        definition_targets[index] = candidates[0]
-        if candidates[0] is not None:
-            named_targets.setdefault(name, set()).add(candidates[0])
-
-    changes: dict[str, list[str | None]] = {}
-    edits: list[tuple[int, int, str]] = []
-    for index, tag in enumerate(tags):
-        name_match = _REF_NAME_ATTR_RE.search(tag.group("attrs"))
-        if not name_match:
-            continue
-        name = _ref_name(name_match)
-        if name in source_names:
-            continue
-        if tag.group("body") is not None:
-            if index not in definition_targets:
-                continue
-            target = definition_targets[index]
-        else:
-            targets = named_targets.get(name, set())
-            if len(targets) != 1:
-                continue
-            (target,) = targets
-        start = tag.start("attrs") + name_match.start()
-        end = tag.start("attrs") + name_match.end()
-        edits.append((start, end, f' name="{target}"' if target else ""))
-        changes.setdefault(name, []).append(target)
-
-    for start, end, replacement in sorted(edits, reverse=True):
-        text = text[:start] + replacement + text[end:]
-    return text, changes
 
 
 async def post_process_assembled(
@@ -943,6 +445,19 @@ async def post_process_assembled(
     return text, citation_languages_filled
 
 
+def _cache_repaired_chunk(
+    cache: TranslationCache, config: Config, chunk: Chunk, skill: SkillContent, facts: VerifiedFacts | None
+) -> None:
+    """Re-cache a repaired chunk under the key translate_chunk read it under
+    (chunk.cache_key), so a rerun's cache lookup gets the repaired text."""
+    model = translation_model(config, chunk)
+    key = chunk.cache_key
+    if key is None:
+        facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
+        key = chunk_cache_key(model, config.target_lang, chunk, skill, facts_block)
+    cache.set(key, model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text)
+
+
 async def run_assembly_repair(
     chunks: list[Chunk],
     source: ArticleSource,
@@ -1098,12 +613,7 @@ async def run_assembly_repair(
                         # already ran (pre-repair) when this chunk was first
                         # translated, so re-caching now with the same key
                         # overwrites that stale entry with the repaired text.
-                        facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
-                        facts_hash = hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
-                        key = compute_key(
-                            config.model, chunk.source_lang, config.target_lang, chunk.text, skill.content_hash, facts_hash
-                        )
-                        cache.set(key, config.model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text)
+                        _cache_repaired_chunk(cache, config, chunk, skill, facts)
                 except Exception as exc:
                     logger.warning(
                         "Assembly-level repair failed for %r chunk %d (round %d): %s",
@@ -1213,6 +723,55 @@ def _consistency_directives(
     return directives
 
 
+async def _repair_chunk_for_review(
+    chunk: Chunk,
+    findings: list[str],
+    structural_errors: list[str],
+    config: Config,
+    review_client: LLMEngineClient,
+    review_model: str,
+    skill: SkillContent,
+    review_pricing: ModelPricing | None,
+    on_retry: RetryCallback | None,
+    qa_skill: SkillContent | None,
+) -> TranslationResult:
+    """Semantic repair (source shown, rewording allowed) when the chunk has
+    review findings; the syntax-only repair when it has only structural errors."""
+    if findings:
+        return await repair_chunk_semantic(
+            review_client,
+            skill,
+            review_model,
+            config.temperature,
+            chunk.source_lang,
+            config.target_lang,
+            chunk.article_title,
+            chunk.section_title,
+            chunk.text,
+            chunk.translated_text or "",
+            findings,
+            review_pricing,
+            structural_errors=structural_errors,
+            on_retry=on_retry,
+            qa_skill=qa_skill,
+        )
+    return await repair_chunk(
+        review_client,
+        skill,
+        review_model,
+        config.temperature,
+        chunk.source_lang,
+        config.target_lang,
+        chunk.article_title,
+        chunk.section_title,
+        chunk.translated_text or "",
+        structural_errors,
+        review_pricing,
+        on_retry=on_retry,
+        qa_skill=qa_skill,
+    )
+
+
 async def run_review_pass(
     chunks: list[Chunk],
     source: ArticleSource,
@@ -1294,7 +853,7 @@ async def run_review_pass(
     # shipping that with a flag is worse than shipping the unreviewed text.
     clean: tuple[list[str | None], str, list[ValidationIssue]] | None = None
     if not _has_structural_error(structural_issues):
-        clean = ([c.translated_text for c in chunks], assembled, review_findings)
+        clean = ([c.translated_text for c in chunks], assembled, combined)
 
     rounds_used = 0
     while combined and rounds_used < config.review_max_repair_attempts:
@@ -1317,54 +876,15 @@ async def run_review_pass(
                 continue
             stats.review_attempts += 1
             try:
-                if findings_for_chunk:
-                    repair_result = await repair_chunk_semantic(
-                        review_client,
-                        skill,
-                        review_model,
-                        config.temperature,
-                        chunk.source_lang,
-                        config.target_lang,
-                        chunk.article_title,
-                        chunk.section_title,
-                        chunk.text,
-                        chunk.translated_text or "",
-                        findings_for_chunk,
-                        review_pricing,
-                        structural_errors=structural_for_chunk,
-                        on_retry=on_retry,
-                        qa_skill=qa_skill,
-                    )
-                else:
-                    repair_result = await repair_chunk(
-                        review_client,
-                        skill,
-                        review_model,
-                        config.temperature,
-                        chunk.source_lang,
-                        config.target_lang,
-                        chunk.article_title,
-                        chunk.section_title,
-                        chunk.translated_text or "",
-                        structural_for_chunk,
-                        review_pricing,
-                        on_retry=on_retry,
-                        qa_skill=qa_skill,
-                    )
+                repair_result = await _repair_chunk_for_review(
+                    chunk, findings_for_chunk, structural_for_chunk, config, review_client, review_model,
+                    skill, review_pricing, on_retry, qa_skill,
+                )
                 stats.record_usage(review_model, repair_result)
                 stats.review_corrections_applied += 1
                 chunk.translated_text = repair_result.text
                 if cache is not None:
-                    facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
-                    facts_hash = (
-                        hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
-                    )
-                    key = compute_key(
-                        review_model, chunk.source_lang, config.target_lang, chunk.text, skill.content_hash, facts_hash
-                    )
-                    cache.set(
-                        key, review_model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text
-                    )
+                    _cache_repaired_chunk(cache, config, chunk, skill, facts)
             except InsufficientCreditsError:
                 raise
             except Exception as exc:
@@ -1384,7 +904,7 @@ async def run_review_pass(
         review_findings = await _run_review_call(assembled)
         combined = structural_issues + review_findings
         if not _has_structural_error(structural_issues):
-            clean = ([c.translated_text for c in chunks], assembled, review_findings)
+            clean = ([c.translated_text for c in chunks], assembled, combined)
 
     if _has_structural_error(structural_issues) and clean is not None:
         logger.warning(
@@ -1394,7 +914,7 @@ async def run_review_pass(
         for chunk, text in zip(chunks, clean[0]):
             chunk.translated_text = text
         assembled = clean[1]
-        combined = [i for i in clean[2]]
+        combined = list(clean[2])
 
     return assembled, combined, rounds_used, removed_comments
 
@@ -1497,6 +1017,615 @@ async def _plan_article(
     return source, chunks, facts
 
 
+class _Engines:
+    """The engines a run sends work to. Every worker shares one instance,
+    because a credit-exhaustion failure can switch the primary engine to
+    config.fallback_provider, or move complex/review work off an exhausted
+    secondary account, part way through a run."""
+
+    def __init__(self, config: Config, client_pool, reporter: ProgressReporter | None):
+        self.config = config
+        self.reporter = reporter
+        self.llm_client = client_pool.get(config.provider)
+        self.review_model = resolve_review_model(config)
+        self.review_provider = resolve_review_provider(config) if self.review_model else None
+        self.review_client = client_pool.get(self.review_provider) if self.review_provider else None
+        self.complex_client = client_pool.get(resolve_complex_provider(config)) if config.complex_model else None
+        self.pricing: ModelPricing | None = None
+        self.complex_pricing: ModelPricing | None = None
+        self.review_pricing: ModelPricing | None = None
+        # Guards the one-time provider switch below: several workers can hit
+        # InsufficientCreditsError for the same exhausted account at once,
+        # but only the first should prompt/log and actually swap the client
+        # — the rest just wait for that swap and retry against it too.
+        self._fallback_lock = asyncio.Lock()
+        self._fallback_switched = False
+        self._fallback_declined = False
+
+    async def load_pricing(self) -> None:
+        config = self.config
+        self.pricing = await self.llm_client.get_pricing_for(config.model)
+        self.complex_pricing = (
+            await self.complex_client.get_pricing_for(config.complex_model)
+            if self.complex_client is not None else None
+        )
+        self.review_pricing = (
+            await self.review_client.get_pricing_for(self.review_model)
+            if self.review_client is not None else None
+        )
+
+    def review_on_primary(self) -> None:
+        self.review_client, self.review_model = self.llm_client, self.config.model
+        self.review_provider, self.review_pricing = self.config.provider, self.pricing
+
+    async def use_primary_for_secondary(self, provider: str | None) -> bool:
+        """Stop sending complex/review work to an exhausted secondary account."""
+        async with self._fallback_lock:
+            config = self.config
+            if provider is None or provider == config.provider:
+                return False
+            updates = {}
+            if resolve_complex_provider(config) == provider:
+                updates.update(complex_provider=config.provider, complex_model=config.model)
+                self.complex_client, self.complex_pricing = self.llm_client, self.pricing
+            if self.review_provider == provider:
+                self.review_on_primary()
+                updates.update(review_provider=self.review_provider, review_model=self.review_model)
+            if updates:
+                logger.warning(
+                    "Secondary provider %r hit its limit; continuing complex/review work on %r (%s).",
+                    provider, config.provider, config.model,
+                )
+                self.config = config.model_copy(update=updates)
+            # True even with nothing to move: the failed call went to an engine
+            # that is no longer in use (another worker already moved the tier,
+            # or the primary was switched), so a retry goes somewhere new.
+            return True
+
+    async def ensure_fallback_engine(self) -> bool:
+        """On the first call, offers (or, non-interactively, just makes)
+        a one-way switch from config.provider to config.fallback_provider
+        after a credit-exhaustion failure. Returns True if chunks should
+        now retry against the (possibly already, by another worker)
+        switched engine, False if there's nothing to switch to or the
+        user declined."""
+        async with self._fallback_lock:
+            if self._fallback_switched:
+                return True
+            if self._fallback_declined:
+                return False
+            config, reporter = self.config, self.reporter
+            target = config.fallback_provider or (
+                # claude_code's own default fallback is opencode_go, not
+                # itself -- a separate binary/session, so it isn't
+                # affected by claude_code hitting its own session/spend
+                # limit (see claude_code_client.ClaudeCodeSessionLimitError).
+                "opencode_go" if config.provider == "claude_code" else "claude_code"
+            )
+            target_model = config.fallback_model or default_model_for_provider(target)
+            if not target or (target == config.provider and (
+                not config.fallback_model or target_model == config.model
+            )):
+                return False
+
+            if target == "openrouter" and not config.openrouter_api_key:
+                logger.error("Cannot switch to OpenRouter: set OPENROUTER_API_KEY or openrouter_api_key.")
+                self._fallback_declined = True
+                return False
+
+            interactive = reporter is not None and reporter.is_live
+            proceed = True
+            if interactive and not config.fallback_auto_switch:
+                reporter.pause()
+                try:
+                    # markup=False: the prompt's own `[provider]`/`[Y/n]`
+                    # brackets would otherwise be parsed as (invalid,
+                    # silently-dropped) Rich style tags -- confirmed in
+                    # practice that Console.input() swallows "[openrouter]"
+                    # entirely rather than printing it literally.
+                    answer = await asyncio.to_thread(
+                        reporter.console.input,
+                        f"\n{config.provider} ran out of credits. Switch to "
+                        f"'{target}' ({target_model}) and continue this run? [Y/n] ",
+                        markup=False,
+                    )
+                finally:
+                    reporter.resume()
+                proceed = answer.strip().lower() not in ("n", "no")
+            else:
+                # Unattended (e.g. `queue` mode has no Live table attached
+                # — see ProgressReporter.is_live): can't block on stdin,
+                # so switch automatically and just log it.
+                logger.warning(
+                    "Provider %r ran out of credits; auto-switching to fallback "
+                    "provider %r for the rest of this run.",
+                    config.provider, target,
+                )
+
+            if not proceed:
+                self._fallback_declined = True
+                return False
+
+            new_config = config.model_copy(
+                update={"provider": target, "model": target_model}
+            )
+            new_client, effective_model = build_llm_client(new_config)
+            if effective_model != new_config.model:
+                new_config = new_config.model_copy(update={"model": effective_model})
+            new_pricing = await new_client.get_pricing_for(new_config.model)
+
+            # Deliberately not closing the old client here: another
+            # worker could still have an in-flight call against it right
+            # up to this point (it only reaches this lock *after*
+            # raising InsufficientCreditsError, not before starting the
+            # call), and aclose()'ing out from under a live request is
+            # worse than leaking one now-unreferenced client for the
+            # rest of the process.
+            old_client = self.llm_client
+            self.llm_client, self.pricing, self.config = new_client, new_pricing, new_config
+            self._fallback_switched = True
+            # A complex/review tier that shared the exhausted primary's client
+            # would otherwise keep calling it, so its retry fails the same way.
+            if self.complex_client is old_client:
+                self.complex_client, self.complex_pricing = new_client, new_pricing
+                self.config = self.config.model_copy(
+                    update={"complex_provider": target, "complex_model": new_config.model}
+                )
+            if self.review_client is old_client:
+                self.review_on_primary()
+
+            logger.warning(
+                "Switched engine to provider=%r model=%r after credit exhaustion.",
+                target, new_config.model,
+            )
+            if reporter is not None and reporter.on_event is not None:
+                reporter.on_event(f"switched provider to {target!r} after credit exhaustion")
+            return True
+
+
+def _claim_pending_items(
+    inputs: list[ArticleInput], config: Config, force: bool, stats: RunStats, article_locks: list[int]
+) -> list[ArticleInput]:
+    """Inputs still to translate. Takes this machine's per-article lock for
+    each one, appending it to article_locks for the caller to release."""
+    pending_items: list[ArticleInput] = []
+    for item in inputs:
+        if not force and article_already_done(config.output_dir, item.title):
+            stats.articles_skipped += 1
+            logger.info("Skipping %r: output already exists", item.title)
+            continue
+        # Another harness process on this machine (different provider/model)
+        # may already be translating this article; two would overwrite each
+        # other's partial_output and burn tokens on the same work.
+        lock = try_lock_article(config.target_lang, output_path_for(config.partial_output_dir, item.title).stem)
+        if lock is None:
+            stats.articles_skipped += 1
+            logger.info("Skipping %r: another local process is already translating it", item.title)
+            continue
+        article_locks.append(lock)
+        if not force and article_already_done(config.output_dir, item.title):
+            # finished by the other process between our first check and getting the lock
+            stats.articles_skipped += 1
+            logger.info("Skipping %r: output already exists", item.title)
+            continue
+        pending_items.append(item)
+    return pending_items
+
+
+def _articles_to_translate(
+    pending_items: list[ArticleInput],
+    planned: list[tuple[ArticleSource, list[Chunk], VerifiedFacts] | None],
+    stats: RunStats,
+) -> list[tuple[ArticleInput, ArticleSource, list[Chunk], VerifiedFacts]]:
+    """Drops articles that failed to plan or already exist on the target wiki at a similar size."""
+    article_plans: list[tuple[ArticleInput, ArticleSource, list[Chunk], VerifiedFacts]] = []
+    for item, plan in zip(pending_items, planned):
+        if plan is None:
+            stats.articles_failed += 1
+            stats.article_results[item.title] = "failed"
+            continue
+        source, chunks, facts = plan
+        if existing_article_matches_by_length(source.wikitext, facts):
+            stats.articles_skipped += 1
+            stats.article_results[item.title] = "skipped"
+            logger.info(
+                "Skipping %r: target article %r already exists and is similar in size (%d vs %d bytes)",
+                item.title,
+                facts.existing_target_title,
+                len(source.wikitext.encode("utf-8")),
+                facts.existing_target_bytes,
+            )
+            continue
+        article_plans.append((item, source, chunks, facts))
+    return article_plans
+
+
+def _estimate_cost(chunks: list[Chunk], pricing: ModelPricing | None) -> float:
+    if pricing is None:
+        return 0.0
+    # Heuristic: assume completion length is roughly comparable to
+    # prompt length for a translation task (source + target text
+    # are similar order of magnitude). Actual cost uses real usage.
+    return sum(
+        chunk.token_estimate * (pricing.prompt_price_per_token + pricing.completion_price_per_token)
+        for chunk in chunks
+    )
+
+
+def _fail_pending_chunks(chunks: list[Chunk]) -> None:
+    for c in chunks:
+        if c.status == ChunkStatus.PENDING:
+            c.status = ChunkStatus.FAILED
+
+
+class _ArticleRunner:
+    """Translates, repairs, reviews and saves one article at a time, sharing
+    the run's engines, caches, clients and worker slots across articles."""
+
+    def __init__(
+        self,
+        engines: _Engines,
+        skill: SkillContent,
+        qa_skill: SkillContent,
+        cache: TranslationCache | None,
+        mw_pool: MediaWikiClientPool,
+        citation_client: httpx.AsyncClient | None,
+        reporter: ProgressReporter | None,
+        stats_tracker: StatsTracker,
+    ):
+        self.engines = engines
+        self.skill = skill
+        self.qa_skill = qa_skill
+        self.cache = cache
+        self.mw_pool = mw_pool
+        self.citation_client = citation_client
+        self.reporter = reporter
+        self.stats_tracker = stats_tracker
+        self.stats = stats_tracker.stats
+        self.slot_queue: asyncio.Queue[int] = asyncio.Queue()
+        for i in range(engines.config.workers):
+            self.slot_queue.put_nowait(i)
+
+    @property
+    def config(self) -> Config:
+        # Read through every time: a provider switch replaces engines.config.
+        return self.engines.config
+
+    def on_retry(self, attempt: int, reason: str, delay: float) -> None:
+        # Matches RetryCallback's (attempt, reason, delay) signature from
+        # openrouter.py's _backoff — model isn't passed through that call
+        # chain, so it's taken from the current config instead.
+        self.stats.retries += 1
+        logger.warning("Retry %d for %s: %s (sleeping %.1fs)", attempt, self.config.model, reason, delay)
+        if self.reporter is not None:
+            self.reporter.on_retry(self.config.model, attempt, reason, delay)
+
+    def _article_done(self, title: str, status: str) -> None:
+        if self.reporter is not None:
+            self.reporter.on_article_done(title, status)
+
+    async def process_article(
+        self, original: ArticleInput, source: ArticleSource, chunks: list[Chunk], facts: VerifiedFacts
+    ) -> None:
+        stats = self.stats
+        checkpoint_input(self.config, ArticleInput(
+            title=source.title, local_path=original.local_path,
+            source_lang=source.source_lang,
+        ))
+        record_attempt(self.config, source.title)
+
+        if not await self._translate_chunks(source, chunks, facts):
+            return
+
+        # All chunks succeeded, proceed with assembly and post-processing
+        engines = self.engines
+        target_mw_client = self.mw_pool.get(self.config.target_lang)
+        assembled, combined_issues, rounds_used, citation_languages_filled, removed_comments = await run_assembly_repair(
+            chunks, source, self.config, engines.llm_client, self.skill, engines.pricing, target_mw_client,
+            self.citation_client, stats, self.on_retry, self.cache, facts, self.qa_skill,
+        )
+
+        config = self.config  # read after repair: a provider switch replaces it
+        warning_findings = (
+            combined_issues
+            if combined_issues
+            and config.save_with_warnings
+            and all(i.severity == "warning" for i in combined_issues)
+            else []
+        )
+        if combined_issues and not warning_findings:
+            stats.articles_needs_human_review += 1
+            stats.article_results[source.title] = "needs_human_review"
+            review_path = record_needs_human_review(config.output_dir, source.title, combined_issues, rounds_used)
+            logger.error(
+                "Article %r needs human review after %d assembly-level repair round(s) — see %s: %s",
+                source.title,
+                rounds_used,
+                review_path,
+                "; ".join(f"{i.kind}: {i.message}" for i in combined_issues),
+            )
+            self._article_done(source.title, "needs_human_review")
+            return
+
+        assembled, review_findings = await self._review(
+            source, chunks, facts, assembled, target_mw_client, removed_comments
+        )
+        flagged = warning_findings + review_findings
+        if flagged:
+            logger.warning(
+                "Article %r has %d unresolved finding(s) (%d warning(s) left after assembly repair, "
+                "%d from the semantic review) — saved anyway: %s",
+                source.title,
+                len(flagged),
+                len(warning_findings),
+                len(review_findings),
+                "; ".join(f"{i.kind}: {i.message}" for i in flagged),
+            )
+
+        # Final mandatory QA gate (qa.py): the review pass may have
+        # rewritten chunks after the last assembly-level QA round, and
+        # a review-flagged article is saved anyway -- a QA defect never is.
+        qa_issues = run_qa_checks(assembled)
+        if qa_issues:
+            stats.articles_needs_human_review += 1
+            stats.article_results[source.title] = "needs_human_review"
+            review_path = record_needs_human_review(self.config.output_dir, source.title, qa_issues, rounds_used)
+            logger.error(
+                "Article %r failed the final QA gate — see %s: %s",
+                source.title,
+                review_path,
+                "; ".join(f"{i.kind}: {i.message}" for i in qa_issues),
+            )
+            self._article_done(source.title, "needs_human_review")
+            return
+
+        self._save(source, chunks, facts, assembled, citation_languages_filled, removed_comments, review_findings)
+
+    async def _translate_chunks(self, source: ArticleSource, chunks: list[Chunk], facts: VerifiedFacts) -> bool:
+        """Translates every chunk; False (with the failure recorded) if any failed."""
+        config, engines, stats = self.config, self.engines, self.stats
+        article_stats = {
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'chunks_done': 0,
+            'failed': False,
+        }
+
+        if config.glossary and len(chunks) > 1 and any(c.status == ChunkStatus.PENDING for c in chunks):
+            try:
+                await build_article_glossary(
+                    chunks, facts, config, engines.llm_client, config.model, self.skill, self.cache,
+                    engines.pricing, stats, self.on_retry,
+                )
+            except Exception as exc:
+                logger.warning("Glossary for %r failed, translating without it: %s", source.title, exc)
+
+        # Execute chunk translation with overall article timeout
+        tasks = [
+            asyncio.ensure_future(self._translate_chunk(source, chunks, c, facts, article_stats)) for c in chunks
+        ]
+        try:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=self.config.article_timeout_s)
+            finally:
+                # gather() leaves the other chunks running when one raises
+                # (ArticleLimitExceeded, an unexpected error): stop them, so a
+                # failed article spends no more tokens or worker slots.
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Article %r translation timed out after %.1f seconds",
+                source.title, self.config.article_timeout_s
+            )
+            _fail_pending_chunks(chunks)
+            article_stats['failed'] = True
+        except ArticleLimitExceeded:
+            # Already logged, mark remaining chunks as failed
+            _fail_pending_chunks(chunks)
+            article_stats['failed'] = True
+        except Exception as exc:
+            logger.error("Unexpected error processing article %r: %s", source.title, exc)
+            article_stats['failed'] = True
+            _fail_pending_chunks(chunks)
+
+        # Determine article outcome
+        failed_chunks = [c for c in chunks if c.status == ChunkStatus.FAILED]
+        if failed_chunks or article_stats['failed']:
+            stats.articles_failed += 1
+            stats.article_results[source.title] = "failed"
+            logger.error(
+                "Article %r failed: %d of %d sections failed",
+                source.title, len(failed_chunks), len(chunks)
+            )
+            self._article_done(source.title, "failed")
+            return False
+        return True
+
+    async def _translate_chunk(
+        self,
+        source: ArticleSource,
+        chunks: list[Chunk],
+        chunk: Chunk,
+        facts: VerifiedFacts,
+        article_stats: dict,
+    ) -> None:
+        engines, reporter = self.engines, self.reporter
+        slot_id = await self.slot_queue.get()
+        try:
+            if reporter is not None:
+                reporter.on_chunk_start(slot_id, chunk.article_title, chunk.section_title)
+            outcome = None
+            for engine_attempt in range(2):  # 1 retry, only after a fallback-provider switch
+                config = self.config
+                attempted_provider = (
+                    resolve_complex_provider(config) if is_complex_routed(config, chunk) else config.provider
+                )
+                try:
+                    outcome = await translate_chunk(
+                        chunk,
+                        config,
+                        engines.llm_client,
+                        self.skill,
+                        self.cache,
+                        engines.pricing,
+                        self.stats,
+                        on_retry=self.on_retry,
+                        verified_facts=facts,
+                        qa_skill=self.qa_skill,
+                        complex_pricing=engines.complex_pricing,
+                        complex_client=engines.complex_client,
+                    )
+                    break
+                except EngineError as exc:
+                    if (
+                        engine_attempt == 0
+                        and isinstance(exc, InsufficientCreditsError)
+                        and (await engines.use_primary_for_secondary(attempted_provider)
+                             or await engines.ensure_fallback_engine())
+                    ):
+                        continue
+                    chunk.status = ChunkStatus.FAILED
+                    logger.error(
+                        "Engine call failed for %s chunk %d: %s", chunk.article_title, chunk.order, exc
+                    )
+                    article_stats['failed'] = True
+                    return
+            if not outcome.validation.valid:
+                logger.error(
+                    "Validation failed for %s chunk %d after repair attempts: %s",
+                    chunk.article_title,
+                    chunk.order,
+                    "; ".join(format_errors(outcome.validation)),
+                )
+                article_stats['failed'] = True
+                return
+            # Update article stats
+            article_stats['input_tokens'] += outcome.prompt_tokens
+            article_stats['output_tokens'] += outcome.completion_tokens
+            article_stats['chunks_done'] += 1
+            logger.info(
+                "Chunk done: %s — %s (%d/%d) [%s]",
+                source.title, chunk.section_title, article_stats['chunks_done'], len(chunks), chunk.status.value,
+            )
+            self._check_article_limits(source, article_stats)
+        finally:
+            if reporter is not None:
+                reporter.on_chunk_done(slot_id)
+            self.slot_queue.put_nowait(slot_id)
+            self.stats_tracker.write(self.config.stats_path)
+            save_partial_article(self.config.partial_output_dir, source.title, chunks)
+
+    def _check_article_limits(self, source: ArticleSource, article_stats: dict) -> None:
+        config = self.config
+        # Check token ratio limit
+        if config.max_token_ratio > 0 and article_stats['input_tokens'] > 0:
+            ratio = article_stats['output_tokens'] / article_stats['input_tokens']
+            if ratio > config.max_token_ratio:
+                logger.error(
+                    "Article %r token ratio exceeded: output/input = %.2f > %.2f",
+                    source.title, ratio, config.max_token_ratio
+                )
+                raise ArticleLimitExceeded(f"Token ratio {ratio:.2f} exceeds limit {config.max_token_ratio}")
+        # Check total token limit
+        if config.max_article_tokens > 0:
+            total_tokens = article_stats['input_tokens'] + article_stats['output_tokens']
+            if total_tokens > config.max_article_tokens:
+                logger.error(
+                    "Article %r total tokens exceeded: %d > %d",
+                    source.title, total_tokens, config.max_article_tokens
+                )
+                raise ArticleLimitExceeded(f"Total tokens {total_tokens} exceeds limit {config.max_article_tokens}")
+
+    async def _review(
+        self,
+        source: ArticleSource,
+        chunks: list[Chunk],
+        facts: VerifiedFacts,
+        assembled: str,
+        target_mw_client: MediaWikiClient,
+        removed_comments: list[str],
+    ) -> tuple[str, list[ValidationIssue]]:
+        """Runs the semantic review pass when a review model is configured.
+        Appends the comments it removes to removed_comments."""
+        engines = self.engines
+        review_findings: list[ValidationIssue] = []
+        if engines.review_model is None:
+            return assembled, review_findings
+        for review_attempt in range(2):
+            attempted_provider = engines.review_provider
+            try:
+                assembled, review_findings, _, review_removed_comments = await run_review_pass(
+                    chunks, source, self.config, assembled, engines.review_client, engines.review_model, self.skill,
+                    engines.review_pricing, target_mw_client, self.stats, facts, self.on_retry, self.cache,
+                    self.qa_skill, self.citation_client,
+                )
+                break
+            except InsufficientCreditsError:
+                switched = False
+                if review_attempt == 0:
+                    switched = await engines.use_primary_for_secondary(attempted_provider)
+                    if not switched and await engines.ensure_fallback_engine():
+                        engines.review_on_primary()
+                        switched = True
+                if switched:
+                    # A failed review may already have repaired chunks, and
+                    # a repair call is where the model leaves its own notes.
+                    removed_comments.extend(reconcile_chunk_comments(chunks))
+                    assembled, _ = await post_process_assembled(
+                        assemble_chunks(chunks), source.title, "\n".join(c.text for c in chunks), self.config,
+                        self.citation_client,
+                        target_mw_client, source.source_lang,
+                    )
+                    continue
+                raise
+        removed_comments.extend(review_removed_comments)
+        if review_findings:
+            self.stats.articles_flagged_by_review += 1
+        return assembled, review_findings
+
+    def _save(
+        self,
+        source: ArticleSource,
+        chunks: list[Chunk],
+        facts: VerifiedFacts,
+        assembled: str,
+        citation_languages_filled: int,
+        removed_comments: list[str],
+        review_findings: list[ValidationIssue],
+    ) -> None:
+        config, stats = self.config, self.stats
+        # Add attribution block as HTML comment at the bottom of the file
+        attribution = build_attribution_block(source)
+        if attribution:
+            assembled = f"{assembled}\n\n{attribution}"
+
+        path = save_article(config.output_dir, source.title, assembled)
+        stats.articles_completed += 1
+        stats.article_results[source.title] = "completed"
+        logger.info("Saved %s", path)
+        discard_partial_article(config.partial_output_dir, source.title)
+
+        if config.generate_reports:
+            report_text = build_article_report(
+                ArticleReportData(
+                    source=source,
+                    chunks=chunks,
+                    facts=facts,
+                    citation_languages_filled=citation_languages_filled,
+                    removed_comments=removed_comments,
+                    review_model=self.engines.review_model,
+                    review_findings=review_findings,
+                ),
+                assembled,
+            )
+            report_path = save_report(config.output_dir, source.title, report_text)
+            logger.info("Saved %s", report_path)
+
+        self._article_done(source.title, "completed")
+
+
 async def run_pipeline(
     config: Config,
     inputs: list[ArticleInput],
@@ -1529,10 +1658,7 @@ async def run_pipeline(
 
     mw_pool = MediaWikiClientPool(config.user_agent, config.source_lang, config.source_wiki_api)
     client_pool, config = build_client_pool(config)
-    llm_client = client_pool.get(config.provider)
-    review_model = resolve_review_model(config)
-    review_provider = resolve_review_provider(config) if review_model else None
-    review_client = client_pool.get(review_provider) if review_provider else None
+    engines = _Engines(config, client_pool, reporter)
     wikidata_client = (
         httpx.AsyncClient(headers={"User-Agent": config.user_agent}, timeout=config.wikidata_timeout_s)
         if config.verify_links
@@ -1544,42 +1670,11 @@ async def run_pipeline(
         httpx.AsyncClient(headers={"User-Agent": config.user_agent}) if config.fill_citation_languages else None
     )
 
-    complex_client = client_pool.get(resolve_complex_provider(config)) if config.complex_model else None
-
     article_locks: list[int] = []  # held until the run ends; the kernel also drops them if we crash
     try:
-        pricing = await llm_client.get_pricing_for(config.model)
-        complex_pricing = (
-            await complex_client.get_pricing_for(config.complex_model)
-            if complex_client is not None else None
-        )
-        review_pricing = (
-            await review_client.get_pricing_for(review_model)
-            if review_client is not None else None
-        )
+        await engines.load_pricing()
 
-        pending_items: list[ArticleInput] = []
-        for item in inputs:
-            if not force and article_already_done(config.output_dir, item.title):
-                stats.articles_skipped += 1
-                logger.info("Skipping %r: output already exists", item.title)
-                continue
-            # Another harness process on this machine (different provider/model)
-            # may already be translating this article; two would overwrite each
-            # other's partial_output and burn tokens on the same work.
-            lock = try_lock_article(config.target_lang, output_path_for(config.partial_output_dir, item.title).stem)
-            if lock is None:
-                stats.articles_skipped += 1
-                logger.info("Skipping %r: another local process is already translating it", item.title)
-                continue
-            article_locks.append(lock)
-            if not force and article_already_done(config.output_dir, item.title):
-                # finished by the other process between our first check and getting the lock
-                stats.articles_skipped += 1
-                logger.info("Skipping %r: output already exists", item.title)
-                continue
-            pending_items.append(item)
-
+        pending_items = _claim_pending_items(inputs, config, force, stats, article_locks)
         fetch_sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
         planned = await asyncio.gather(
             *(
@@ -1587,462 +1682,21 @@ async def run_pipeline(
                 for item in pending_items
             )
         )
-
-        article_plans: list[tuple[ArticleSource, list[Chunk], VerifiedFacts]] = []
-        for item, plan in zip(pending_items, planned):
-            if plan is None:
-                stats.articles_failed += 1
-                stats.article_results[item.title] = "failed"
-                continue
-            source, chunks, facts = plan
-            if existing_article_matches_by_length(source.wikitext, facts):
-                stats.articles_skipped += 1
-                stats.article_results[item.title] = "skipped"
-                logger.info(
-                    "Skipping %r: target article %r already exists and is similar in size (%d vs %d bytes)",
-                    item.title,
-                    facts.existing_target_title,
-                    len(source.wikitext.encode("utf-8")),
-                    facts.existing_target_bytes,
-                )
-                continue
-            article_plans.append(plan)
-
-        total_chunks = sum(len(chunks) for _, chunks, _ in article_plans)
-        estimated_cost = 0.0
-        if pricing is not None:
-            for _, chunks, _ in article_plans:
-                for chunk in chunks:
-                    # Heuristic: assume completion length is roughly comparable to
-                    # prompt length for a translation task (source + target text
-                    # are similar order of magnitude). Actual cost uses real usage.
-                    estimated_cost += chunk.token_estimate * (
-                        pricing.prompt_price_per_token + pricing.completion_price_per_token
-                    )
+        article_plans = _articles_to_translate(pending_items, planned, stats)
 
         if reporter is not None:
+            all_chunks = [chunk for _, _, chunks, _ in article_plans for chunk in chunks]
             reporter.set_plan(
-                len(article_plans), total_chunks, estimated_cost,
-                {source.title: len(chunks) for source, chunks, _ in article_plans},
+                len(article_plans), len(all_chunks), _estimate_cost(all_chunks, engines.pricing),
+                {source.title: len(chunks) for _, source, chunks, _ in article_plans},
             )
 
-        slot_queue: asyncio.Queue[int] = asyncio.Queue()
-        for i in range(config.workers):
-            slot_queue.put_nowait(i)
-
-        def on_retry(attempt: int, reason: str, delay: float) -> None:
-            # Matches RetryCallback's (attempt, reason, delay) signature from
-            # openrouter.py's _backoff — model isn't passed through that call
-            # chain, so it's taken from the enclosing config instead.
-            stats.retries += 1
-            logger.warning("Retry %d for %s: %s (sleeping %.1fs)", attempt, config.model, reason, delay)
-            if reporter is not None:
-                reporter.on_retry(config.model, attempt, reason, delay)
-
-        # Guards the one-time provider switch below: several workers can hit
-        # InsufficientCreditsError for the same exhausted account at once,
-        # but only the first should prompt/log and actually swap the client
-        # — the rest just wait for that swap and retry against it too.
-        fallback_lock = asyncio.Lock()
-        fallback_switched = False
-        fallback_declined = False
-
-        async def use_primary_for_secondary(provider: str | None) -> bool:
-            """Stop sending complex/review work to an exhausted secondary account."""
-            nonlocal config, complex_client, complex_pricing
-            nonlocal review_client, review_model, review_provider, review_pricing
-            async with fallback_lock:
-                if provider is None or provider == config.provider:
-                    return False
-                logger.warning(
-                    "Secondary provider %r hit its limit; continuing complex/review work on %r (%s).",
-                    provider, config.provider, config.model,
-                )
-                updates = {}
-                if resolve_complex_provider(config) == provider:
-                    updates.update(complex_provider=config.provider, complex_model=config.model)
-                    complex_client, complex_pricing = llm_client, pricing
-                if review_provider == provider:
-                    review_provider, review_model = config.provider, config.model
-                    review_client, review_pricing = llm_client, pricing
-                    updates.update(review_provider=review_provider, review_model=review_model)
-                config = config.model_copy(update=updates)
-                return True
-
-        async def ensure_fallback_engine() -> bool:
-            """On the first call, offers (or, non-interactively, just makes)
-            a one-way switch from config.provider to config.fallback_provider
-            after a credit-exhaustion failure. Returns True if chunks should
-            now retry against the (possibly already, by another worker)
-            switched engine, False if there's nothing to switch to or the
-            user declined."""
-            nonlocal llm_client, pricing, config, fallback_switched, fallback_declined
-            async with fallback_lock:
-                if fallback_switched:
-                    return True
-                if fallback_declined:
-                    return False
-                target = config.fallback_provider or (
-                    # claude_code's own default fallback is opencode_go, not
-                    # itself -- a separate binary/session, so it isn't
-                    # affected by claude_code hitting its own session/spend
-                    # limit (see claude_code_client.ClaudeCodeSessionLimitError).
-                    "opencode_go" if config.provider == "claude_code" else "claude_code"
-                )
-                target_model = config.fallback_model or default_model_for_provider(target)
-                if not target or (target == config.provider and (
-                    not config.fallback_model or target_model == config.model
-                )):
-                    return False
-
-                if target == "openrouter" and not config.openrouter_api_key:
-                    logger.error("Cannot switch to OpenRouter: set OPENROUTER_API_KEY or openrouter_api_key.")
-                    fallback_declined = True
-                    return False
-
-                interactive = reporter is not None and reporter.is_live
-                proceed = True
-                if interactive and not config.fallback_auto_switch:
-                    reporter.pause()
-                    try:
-                        # markup=False: the prompt's own `[provider]`/`[Y/n]`
-                        # brackets would otherwise be parsed as (invalid,
-                        # silently-dropped) Rich style tags -- confirmed in
-                        # practice that Console.input() swallows "[openrouter]"
-                        # entirely rather than printing it literally.
-                        answer = await asyncio.to_thread(
-                            reporter.console.input,
-                            f"\n{config.provider} ran out of credits. Switch to "
-                            f"'{target}' ({target_model}) and continue this run? [Y/n] ",
-                            markup=False,
-                        )
-                    finally:
-                        reporter.resume()
-                    proceed = answer.strip().lower() not in ("n", "no")
-                else:
-                    # Unattended (e.g. `queue` mode has no Live table attached
-                    # — see ProgressReporter.is_live): can't block on stdin,
-                    # so switch automatically and just log it.
-                    logger.warning(
-                        "Provider %r ran out of credits; auto-switching to fallback "
-                        "provider %r for the rest of this run.",
-                        config.provider, target,
-                    )
-
-                if not proceed:
-                    fallback_declined = True
-                    return False
-
-                new_config = config.model_copy(
-                    update={"provider": target, "model": target_model}
-                )
-                new_client, effective_model = build_llm_client(new_config)
-                if effective_model != new_config.model:
-                    new_config = new_config.model_copy(update={"model": effective_model})
-                new_pricing = await new_client.get_pricing_for(new_config.model)
-
-                # Deliberately not closing the old client here: another
-                # worker could still have an in-flight call against it right
-                # up to this point (it only reaches this lock *after*
-                # raising InsufficientCreditsError, not before starting the
-                # call), and aclose()'ing out from under a live request is
-                # worse than leaking one now-unreferenced client for the
-                # rest of the process.
-                llm_client, pricing, config = new_client, new_pricing, new_config
-                fallback_switched = True
-
-                logger.warning(
-                    "Switched engine to provider=%r model=%r after credit exhaustion.",
-                    target, new_config.model,
-                )
-                if reporter is not None and reporter.on_event is not None:
-                    reporter.on_event(f"switched provider to {target!r} after credit exhaustion")
-                return True
-
-        async def process_article(source: ArticleSource, chunks: list[Chunk], facts: VerifiedFacts) -> None:
-            nonlocal review_client, review_model, review_provider, review_pricing
-            original = next(
-                (item for item, plan in zip(pending_items, planned)
-                 if plan is not None and plan[0] is source),
-                ArticleInput(title=source.title, source_lang=source.source_lang),
-            )
-            checkpoint_input(config, ArticleInput(
-                title=source.title, local_path=original.local_path,
-                source_lang=source.source_lang,
-            ))
-            record_attempt(config, source.title)
-            article_stats = {
-                'input_tokens': 0,
-                'output_tokens': 0,
-                'start_time': time.monotonic(),
-                'chunks_done': 0,
-                'failed': False,
-                'limit_exceeded': False,
-            }
-
-            async def process_chunk(chunk: Chunk, facts: VerifiedFacts) -> None:
-                slot_id = await slot_queue.get()
-                try:
-                    if reporter is not None:
-                        reporter.on_chunk_start(slot_id, chunk.article_title, chunk.section_title)
-                    outcome = None
-                    for engine_attempt in range(2):  # 1 retry, only after a fallback-provider switch
-                        attempted_provider = (
-                            resolve_complex_provider(config)
-                            if config.complex_model and chunk.is_complex else config.provider
-                        )
-                        try:
-                            outcome = await translate_chunk(
-                                chunk,
-                                config,
-                                llm_client,
-                                skill,
-                                cache,
-                                pricing,
-                                stats,
-                                on_retry=on_retry,
-                                verified_facts=facts,
-                                qa_skill=qa_skill,
-                                complex_pricing=complex_pricing,
-                                complex_client=complex_client,
-                            )
-                            break
-                        except EngineError as exc:
-                            if (
-                                engine_attempt == 0
-                                and isinstance(exc, InsufficientCreditsError)
-                                and (await use_primary_for_secondary(attempted_provider)
-                                     or await ensure_fallback_engine())
-                            ):
-                                continue
-                            chunk.status = ChunkStatus.FAILED
-                            logger.error(
-                                "Engine call failed for %s chunk %d: %s", chunk.article_title, chunk.order, exc
-                            )
-                            article_stats['failed'] = True
-                            return
-                    if not outcome.validation.valid:
-                        logger.error(
-                            "Validation failed for %s chunk %d after repair attempts: %s",
-                            chunk.article_title,
-                            chunk.order,
-                            "; ".join(format_errors(outcome.validation)),
-                        )
-                        article_stats['failed'] = True
-                        return
-                    # Update article stats
-                    article_stats['input_tokens'] += outcome.prompt_tokens
-                    article_stats['output_tokens'] += outcome.completion_tokens
-                    article_stats['chunks_done'] += 1
-                    logger.info(
-                        "Chunk done: %s — %s (%d/%d) [%s]",
-                        source.title, chunk.section_title, article_stats['chunks_done'], len(chunks), chunk.status.value,
-                    )
-                    # Check token ratio limit
-                    if config.max_token_ratio > 0 and article_stats['input_tokens'] > 0:
-                        ratio = article_stats['output_tokens'] / article_stats['input_tokens']
-                        if ratio > config.max_token_ratio:
-                            logger.error(
-                                "Article %r token ratio exceeded: output/input = %.2f > %.2f",
-                                source.title, ratio, config.max_token_ratio
-                            )
-                            article_stats['limit_exceeded'] = True
-                            raise ArticleLimitExceeded(f"Token ratio {ratio:.2f} exceeds limit {config.max_token_ratio}")
-                    # Check total token limit
-                    if config.max_article_tokens > 0:
-                        total_tokens = article_stats['input_tokens'] + article_stats['output_tokens']
-                        if total_tokens > config.max_article_tokens:
-                            logger.error(
-                                "Article %r total tokens exceeded: %d > %d",
-                                source.title, total_tokens, config.max_article_tokens
-                            )
-                            article_stats['limit_exceeded'] = True
-                            raise ArticleLimitExceeded(f"Total tokens {total_tokens} exceeds limit {config.max_article_tokens}")
-                finally:
-                    if reporter is not None:
-                        reporter.on_chunk_done(slot_id)
-                    slot_queue.put_nowait(slot_id)
-                    stats_tracker.write(config.stats_path)
-                    save_partial_article(config.partial_output_dir, source.title, chunks)
-
-            if config.glossary and len(chunks) > 1 and any(c.status == ChunkStatus.PENDING for c in chunks):
-                try:
-                    await build_article_glossary(
-                        chunks, facts, config, llm_client, config.model, skill, cache, pricing, stats, on_retry
-                    )
-                except Exception as exc:
-                    logger.warning("Glossary for %r failed, translating without it: %s", source.title, exc)
-
-            # Execute chunk translation with overall article timeout
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(process_chunk(c, facts) for c in chunks)),
-                    timeout=config.article_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    "Article %r translation timed out after %.1f seconds",
-                    source.title, config.article_timeout_s
-                )
-                # Mark remaining pending chunks as failed
-                for c in chunks:
-                    if c.status == ChunkStatus.PENDING:
-                        c.status = ChunkStatus.FAILED
-                article_stats['failed'] = True
-            except ArticleLimitExceeded:
-                # Already logged, mark remaining chunks as failed
-                for c in chunks:
-                    if c.status == ChunkStatus.PENDING:
-                        c.status = ChunkStatus.FAILED
-                article_stats['failed'] = True
-            except Exception as exc:
-                logger.error("Unexpected error processing article %r: %s", source.title, exc)
-                article_stats['failed'] = True
-                for c in chunks:
-                    if c.status == ChunkStatus.PENDING:
-                        c.status = ChunkStatus.FAILED
-
-            # Determine article outcome
-            failed_chunks = [c for c in chunks if c.status == ChunkStatus.FAILED]
-            if failed_chunks or article_stats['failed']:
-                stats.articles_failed += 1
-                stats.article_results[source.title] = "failed"
-                logger.error(
-                    "Article %r failed: %d of %d sections failed",
-                    source.title, len(failed_chunks), len(chunks)
-                )
-                if reporter is not None:
-                    reporter.on_article_done(source.title, "failed")
-                return
-
-            # All chunks succeeded, proceed with assembly and post-processing
-            target_mw_client = mw_pool.get(config.target_lang)
-            assembled, combined_issues, rounds_used, citation_languages_filled, removed_comments = await run_assembly_repair(
-                chunks, source, config, llm_client, skill, pricing, target_mw_client, citation_client, stats, on_retry,
-                cache, facts, qa_skill,
-            )
-
-            warning_findings = (
-                combined_issues
-                if combined_issues
-                and config.save_with_warnings
-                and all(i.severity == "warning" for i in combined_issues)
-                else []
-            )
-            if combined_issues and not warning_findings:
-                stats.articles_needs_human_review += 1
-                stats.article_results[source.title] = "needs_human_review"
-                review_path = record_needs_human_review(config.output_dir, source.title, combined_issues, rounds_used)
-                logger.error(
-                    "Article %r needs human review after %d assembly-level repair round(s) — see %s: %s",
-                    source.title,
-                    rounds_used,
-                    review_path,
-                    "; ".join(f"{i.kind}: {i.message}" for i in combined_issues),
-                )
-                if reporter is not None:
-                    reporter.on_article_done(source.title, "needs_human_review")
-                return
-
-            review_findings: list[ValidationIssue] = []
-            if review_model is not None:
-                for review_attempt in range(2):
-                    attempted_provider = review_provider
-                    try:
-                        assembled, review_findings, review_rounds, review_removed_comments = await run_review_pass(
-                            chunks, source, config, assembled, review_client, review_model, skill,
-                            review_pricing, target_mw_client, stats, facts, on_retry, cache, qa_skill,
-                            citation_client,
-                        )
-                        break
-                    except InsufficientCreditsError:
-                        switched = False
-                        if review_attempt == 0:
-                            switched = await use_primary_for_secondary(attempted_provider)
-                            if not switched and await ensure_fallback_engine():
-                                review_client, review_model = llm_client, config.model
-                                review_provider, review_pricing = config.provider, pricing
-                                switched = True
-                        if switched:
-                            # A failed review may already have repaired chunks.
-                            assembled, _ = await post_process_assembled(
-                                assemble_chunks(chunks), source.title, source.wikitext, config, citation_client,
-                                target_mw_client, source.source_lang,
-                            )
-                            continue
-                        raise
-                removed_comments.extend(review_removed_comments)
-                if review_findings:
-                    stats.articles_flagged_by_review += 1
-            else:
-                review_rounds = 0
-            flagged = warning_findings + review_findings
-            if flagged:
-                logger.warning(
-                    "Article %r has %d unresolved finding(s) (%d warning(s) left after assembly repair, "
-                    "%d from the semantic review) — saved anyway: %s",
-                    source.title,
-                    len(flagged),
-                    len(warning_findings),
-                    len(review_findings),
-                    "; ".join(f"{i.kind}: {i.message}" for i in flagged),
-                )
-
-            # Final mandatory QA gate (qa.py): the review pass may have
-            # rewritten chunks after the last assembly-level QA round, and
-            # a review-flagged article is saved anyway -- a QA defect never is.
-            qa_issues = run_qa_checks(assembled)
-            if qa_issues:
-                stats.articles_needs_human_review += 1
-                stats.article_results[source.title] = "needs_human_review"
-                review_path = record_needs_human_review(config.output_dir, source.title, qa_issues, rounds_used)
-                logger.error(
-                    "Article %r failed the final QA gate — see %s: %s",
-                    source.title,
-                    review_path,
-                    "; ".join(f"{i.kind}: {i.message}" for i in qa_issues),
-                )
-                if reporter is not None:
-                    reporter.on_article_done(source.title, "needs_human_review")
-                return
-
-            # Add attribution block as HTML comment at the bottom of the file
-            attribution = build_attribution_block(source)
-            if attribution:
-                assembled = f"{assembled}\n\n{attribution}"
-
-            path = save_article(config.output_dir, source.title, assembled)
-            stats.articles_completed += 1
-            stats.article_results[source.title] = "completed"
-            logger.info("Saved %s", path)
-            discard_partial_article(config.partial_output_dir, source.title)
-
-            if config.generate_reports:
-                report_text = build_article_report(
-                    ArticleReportData(
-                        source=source,
-                        chunks=chunks,
-                        facts=facts,
-                        citation_languages_filled=citation_languages_filled,
-                        removed_comments=removed_comments,
-                        review_model=review_model,
-                        review_findings=review_findings,
-                    ),
-                    assembled,
-                )
-                report_path = save_report(config.output_dir, source.title, report_text)
-                logger.info("Saved %s", report_path)
-
-            if reporter is not None:
-                reporter.on_article_done(source.title, "completed")
-
+        runner = _ArticleRunner(engines, skill, qa_skill, cache, mw_pool, citation_client, reporter, stats_tracker)
         if config.sequential:
-            for source, chunks, facts in article_plans:
-                await process_article(source, chunks, facts)
+            for plan in article_plans:
+                await runner.process_article(*plan)
         else:
-            await asyncio.gather(
-                *(process_article(source, chunks, facts) for source, chunks, facts in article_plans)
-            )
+            await asyncio.gather(*(runner.process_article(*plan) for plan in article_plans))
 
     finally:
         for lock in article_locks:
@@ -2060,7 +1714,7 @@ async def run_pipeline(
         # single-provider run (the common case, llm_client IS the pool's
         # one entry) still closes exactly one client, not two.
         seen_clients: set[int] = set()
-        for client in (llm_client, *client_pool.clients.values()):
+        for client in (engines.llm_client, *client_pool.clients.values()):
             if id(client) in seen_clients:
                 continue
             seen_clients.add(id(client))
@@ -2077,10 +1731,10 @@ async def run_pipeline(
         # force when the run ended, including a mid-run fallback switch
         # (ensure_fallback_engine) -- callers like queue_runner.py want
         # that effective value, not just what the run started with.
-        stats_tracker.stats.provider = config.provider
-        stats_tracker.stats.model = config.model
-        stats_tracker.stats.review_model = review_model
-        stats_tracker.stats.review_provider = review_provider
-        stats_tracker.write(config.stats_path)
+        stats_tracker.stats.provider = engines.config.provider
+        stats_tracker.stats.model = engines.config.model
+        stats_tracker.stats.review_model = engines.review_model
+        stats_tracker.stats.review_provider = engines.review_provider
+        stats_tracker.write(engines.config.stats_path)
 
     return stats_tracker

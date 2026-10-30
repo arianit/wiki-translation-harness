@@ -24,7 +24,8 @@ _ALBANIAN_MONTHS = "janar|shkurt|mars|prill|maj|qershor|korrik|gusht|shtator|tet
 
 _CITE_RE = re.compile(r"\{\{\s*[Cc]ite [a-z]+\s*\|[^{}]*\}\}|\{\{\s*[Cc]itation\s*\|[^{}]*\}\}")
 _CITE_WEB_RE = re.compile(r"\{\{\s*[Cc]ite web\s*\|[^{}]*\}\}")
-_URL_RE = re.compile(r"(?<![-a-zA-Z])url\s*=\s*\S|chapter-url\s*=\s*\S")
+# A value must follow: `|url= |title=` and `|url=}}` are as url-less as no |url=.
+_URL_RE = re.compile(r"(?<![-a-zA-Z])url\s*=\s*[^\s|}]|chapter-url\s*=\s*[^\s|}]")
 _URL_QUALIFIER_RE = re.compile(r"\b(access-date|archive-url|archive-date)\s*=")
 _SFNMP_RE = re.compile(r"\{\{\s*[Ss]fnmp\s*\|[^{}]*\}\}")
 _HAS_REFS_RE = re.compile(r"<ref\b|\{\{\s*(?:sfn[a-z]*|harvnb)\s*\|", re.IGNORECASE)

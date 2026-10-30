@@ -123,3 +123,13 @@ def test_chunk_never_splits_ref_inside_references_block():
     assert "".join(c.text for c in chunks) == text
     for c in chunks:
         assert c.text.count("<ref ") == c.text.count("</ref>")
+
+
+def test_chunk_never_splits_html_comment():
+    words = " ".join(["word"] * 60)
+    comment = f"<!--\n{words}\n\n{words}\n\n{words}\n-->"
+    text = f"Intro.\n\n== Body ==\n{words}\n\n{comment}\n\n{words}\n"
+    chunks = build_chunks("Test", split_into_sections(text), chunk_min=10, chunk_max=50)
+    assert "".join(c.text for c in chunks) == text
+    for c in chunks:
+        assert c.text.count("<!--") == c.text.count("-->")

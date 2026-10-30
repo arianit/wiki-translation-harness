@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import random
 import time
@@ -98,7 +97,7 @@ class EvaluationScores:
     terminology_quality: int
     mediawiki_quality: int
     publication_readiness: int
-    overall_score: int
+    overall_score: float  # the judge is told overall may be fractional
 
 
 @dataclass
@@ -212,6 +211,16 @@ def parse_evaluation_response(response_text: str) -> dict[str, Any]:
     return result
 
 
+def _score(value: Any, cast: type = int) -> int | float:
+    """A judge-reported score as a number; 0 when it is missing or not
+    numeric ("7.5", None, "n/a"), so one malformed field can't discard the
+    whole (already paid-for) evaluation."""
+    try:
+        return cast(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def create_evaluation_result(
     judge_model: str,
     label_to_model: dict[str, str],
@@ -224,16 +233,16 @@ def create_evaluation_result(
 ) -> EvaluationResult:
     """Create EvaluationResult from parsed data."""
     scores = []
-    for label, model in label_to_model.items():
+    for label in label_to_model:
         score_data = parsed_data.get('scores', {}).get(label, {})
         scores.append(EvaluationScores(
             label=label,
-            translation_accuracy=int(score_data.get('translation_accuracy', 0)),
-            albanian_quality=int(score_data.get('albanian_quality', 0)),
-            terminology_quality=int(score_data.get('terminology_quality', 0)),
-            mediawiki_quality=int(score_data.get('mediawiki_quality', 0)),
-            publication_readiness=int(score_data.get('publication_readiness', 0)),
-            overall_score=int(score_data.get('overall', 0)),
+            translation_accuracy=_score(score_data.get('translation_accuracy')),
+            albanian_quality=_score(score_data.get('albanian_quality')),
+            terminology_quality=_score(score_data.get('terminology_quality')),
+            mediawiki_quality=_score(score_data.get('mediawiki_quality')),
+            publication_readiness=_score(score_data.get('publication_readiness')),
+            overall_score=_score(score_data.get('overall'), float),
         ))
     ranking = parsed_data.get('ranking', [])
     detailed_explanations = parsed_data.get('detailed_explanations', {})
@@ -408,7 +417,7 @@ def save_evaluation_results(
     comparison_path = output_dir / "comparison.md"
     with open(comparison_path, "w", encoding="utf-8") as f:
         f.write(f"# Comparison: {source_title}\n\n")
-        f.write(f"## Benchmark Results\n\n")
+        f.write("## Benchmark Results\n\n")
         f.write("| Model | Runtime (s) | Input Tokens | Output Tokens | Cost | Failed Sections |\n")
         f.write("|-------|-------------|--------------|---------------|------|-----------------|\n")
         for model, res in benchmark_results.items():

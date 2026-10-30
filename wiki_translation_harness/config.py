@@ -82,6 +82,16 @@ def build_config(
             if value is not None:
                 data[key] = value
 
+    # --base-url overrides whichever provider is active, including one set
+    # only in config.yaml (e.g. `provider: local` with no --provider flag).
+    base_url = data.pop("base_url", None)
+    if base_url is not None:
+        base_url_key = {
+            "local": "local_base_url",
+            "experiential": "experiential_base_url",
+        }.get(data.get("provider", "claude_code"), "openrouter_base_url")
+        data[base_url_key] = base_url
+
     # If the CLI explicitly switched --provider without also passing
     # --model, a model id left over in config.yaml for the *previous*
     # provider must not silently survive the switch. Confirmed necessary in

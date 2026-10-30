@@ -21,7 +21,6 @@ import json
 import random
 import subprocess
 import tempfile
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -114,6 +113,12 @@ def _write_diagnostic_log(
         return None
 
 
+def _as_text(output: bytes | str | None) -> str:
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
+
+
 def run_claude_cli(
     system_prompt: str,
     user_prompt: str,
@@ -176,7 +181,8 @@ def run_claude_cli(
     except subprocess.TimeoutExpired as exc:
         log_path = _write_diagnostic_log(
             log_dir, model=model, note=f"timed out after {timeout_s}s",
-            stdout=exc.stdout or "", stderr=exc.stderr or "",
+            # TimeoutExpired carries bytes even when run with text=True.
+            stdout=_as_text(exc.stdout), stderr=_as_text(exc.stderr),
         )
         stderr_msg = f"claude CLI call timed out after {timeout_s}s: {exc}"
         if log_path:

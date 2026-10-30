@@ -20,6 +20,11 @@ import pytest
 from wiki_translation_harness.cache import TranslationCache, compute_key
 from wiki_translation_harness.models import Chunk, Config, RunStats, ValidationIssue
 from wiki_translation_harness.pipeline import (
+    run_assembly_repair,
+    run_review_pass,
+    _consistency_directives,
+)
+from wiki_translation_harness.reference_fixes import (
     collapse_duplicate_list_defined_refs,
     drop_stray_reference_lists,
     extend_references_block_over_trailing_defs,
@@ -29,9 +34,6 @@ from wiki_translation_harness.pipeline import (
     collapse_conflicting_ref_definitions,
     restore_ref_group_names,
     restore_ref_names,
-    run_assembly_repair,
-    run_review_pass,
-    _consistency_directives,
 )
 from wiki_translation_harness.skill_loader import SkillContent
 from wiki_translation_harness.verification import VerifiedFacts
@@ -283,6 +285,27 @@ async def test_repaired_chunk_is_re_cached(tmp_path: Path):
         key = compute_key(config.model, chunk.source_lang, config.target_lang, chunk.text, skill.content_hash, "")
         assert cache.get(key) == chunk.translated_text
         assert "harvc" not in cache.get(key)
+    finally:
+        cache.close()
+
+
+@pytest.mark.asyncio
+async def test_repaired_chunk_is_re_cached_under_translation_key(tmp_path: Path):
+    # The verified-facts block in the key grows while the article is
+    # translated (established ill renderings), so the repair must reuse the
+    # key translate_chunk actually read rather than recompute it.
+    chunk = _chunk("{{harvc|last=Smith}}")
+    chunk.cache_key = "key-translate-chunk-used"
+    client = FakeOpenRouterClient(["{{Cite book|last=Smith}}"])
+    cache = TranslationCache(tmp_path / "cache.sqlite3")
+    try:
+        await run_assembly_repair(
+            [chunk], _FakeSource(), _config(max_assembly_repair_rounds=3), client, _skill(), None,
+            FakeMediaWikiClient(raise_if_called=True), None, RunStats(),
+            cache=cache, facts=VerifiedFacts(),
+        )
+        assert cache.get("key-translate-chunk-used") == chunk.translated_text
+        assert "harvc" not in chunk.translated_text
     finally:
         cache.close()
 
@@ -823,6 +846,49 @@ async def test_secondary_limit_retries_on_primary(tmp_path, monkeypatch, limited
         assert len(review_calls) == 2
     else:
         assert translation_calls == ['claude_code', 'codex']
+
+@pytest.mark.asyncio
+async def test_fallback_switch_moves_complex_tier_sharing_primary(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import wiki_translation_harness.pipeline as pipeline
+    from wiki_translation_harness.engines import ClientPool
+    from wiki_translation_harness.models import ArticleSource, InsufficientCreditsError, ChunkStatus
+    from wiki_translation_harness.sources import ArticleInput
+
+    cfg = _config(provider='codex', model='gpt-6-luna', complex_model='gpt-6-sol',
+                  fallback_provider='claude_code', fallback_model='claude-sonnet-5-5',
+                  cache=False, verify_links=False, fill_citation_languages=False, user_agent='test-harness',
+                  generate_reports=False,
+                  output_dir=tmp_path / 'output', partial_output_dir=tmp_path / 'partial',
+                  stats_path=tmp_path / 'stats.json')
+    primary = SimpleNamespace(get_pricing_for=AsyncMock(return_value=None), aclose=AsyncMock())
+    fallback = SimpleNamespace(get_pricing_for=AsyncMock(return_value=None), aclose=AsyncMock())
+    monkeypatch.setattr(pipeline, 'build_client_pool', lambda config: (ClientPool({'codex': primary}), config))
+    monkeypatch.setattr(pipeline, 'build_llm_client', lambda config: (fallback, config.model))
+    monkeypatch.setattr(pipeline, 'load_skill', lambda *args: _skill())
+    chunk = _chunk('Translated text')
+    chunk.is_complex = True
+    source = ArticleSource(title='Test Article', wikitext='English text')
+    monkeypatch.setattr(pipeline, '_plan_article', AsyncMock(return_value=(source, [chunk], VerifiedFacts())))
+    complex_clients = []
+
+    async def translate(chunk, config, client, *args, complex_client=None, **kwargs):
+        complex_clients.append(complex_client)
+        if complex_client is primary:
+            raise InsufficientCreditsError('weekly limit')
+        chunk.status = ChunkStatus.TRANSLATED
+        return SimpleNamespace(validation=SimpleNamespace(valid=True), prompt_tokens=10, completion_tokens=10)
+
+    monkeypatch.setattr(pipeline, 'translate_chunk', translate)
+    monkeypatch.setattr(pipeline, 'run_assembly_repair', AsyncMock(return_value=('Translated text', [], 0, 0, [])))
+    review = AsyncMock(return_value=('Translated text', [], 0, []))
+    monkeypatch.setattr(pipeline, 'run_review_pass', review)
+    result = await pipeline.run_pipeline(cfg, [ArticleInput(source.title)], resume_unfinished=False)
+    assert result.stats.articles_completed == 1
+    assert complex_clients == [primary, fallback]
+    assert review.call_args.args[4] is fallback
+    assert result.stats.review_provider == 'claude_code'
 
 @pytest.mark.asyncio
 async def test_unbalanced_link_only_repairs_owning_chunk():

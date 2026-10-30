@@ -6,7 +6,7 @@ import json
 import subprocess
 import tempfile
 
-from wiki_translation_harness.models import EngineError, InsufficientCreditsError
+from wiki_translation_harness.models import EngineError, InsufficientCreditsError, looks_like_usage_limit
 
 
 class CodexError(EngineError):
@@ -57,7 +57,7 @@ def run_codex_cli(cli_path: str, model: str, prompt: str, timeout_s: float):
             errors.append(event.get("message") or (event.get("error") or {}).get("message") or str(event))
     if proc.returncode or errors:
         detail = "\n".join(errors) or proc.stderr[-2000:] or "Codex exited without a response"
-        if any(s in detail.lower() for s in ("usage limit", "rate limit", "rate_limit", "quota", "429")):
+        if looks_like_usage_limit(detail):
             raise InsufficientCreditsError(f"Codex subscription limit: {detail}")
         raise CodexError(detail)
     if not messages or not messages[-1].strip():

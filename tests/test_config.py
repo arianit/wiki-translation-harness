@@ -136,3 +136,11 @@ def test_qa_skill_path_cannot_be_disabled():
 
     with pytest.raises(ValidationError):
         Config(qa_skill_path=None)
+
+
+def test_base_url_applies_to_yaml_provider(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("provider: local\nmodel: some-local-model\n")
+    cfg = build_config(config_file, {**_CONTACT, "base_url": "http://h:1/v1"})
+    assert cfg.local_base_url == "http://h:1/v1"
