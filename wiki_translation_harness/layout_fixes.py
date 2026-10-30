@@ -30,6 +30,12 @@ _EN_MONTHS = {
         "january february march april may june july august september october november december".split()
     )
 }
+_SQ_MONTH_ONLY_RE = re.compile(r"^(\s*)([A-Za-zëË]+)(\s+\d{4})(\s*)$")
+_SQ_MONTHS = {
+    "janar": "January", "shkurt": "February", "mars": "March", "prill": "April", "maj": "May",
+    "qershor": "June", "korrik": "July", "gusht": "August", "shtator": "September",
+    "tetor": "October", "nëntor": "November", "dhjetor": "December",
+}
 _DATE_PARAMS = ("date", "access-date", "accessdate", "archive-date", "archivedate")
 
 
@@ -121,6 +127,11 @@ def fix_archive_dates(text: str) -> tuple[str, int]:
                     iso = "-".join(wb.groups())
             if iso is None:
                 iso = _iso_from_english(current)
+            if iso is None and (sq := _SQ_MONTH_ONLY_RE.match(raw)) and sq.group(2).lower() in _SQ_MONTHS:
+                # An Albanian month name in a month-only date crashes CS1; restore the English form.
+                param.value = f"{sq.group(1)}{_SQ_MONTHS[sq.group(2).lower()]}{sq.group(3)}{sq.group(4)}"
+                fixed += 1
+                continue
             if iso and iso != current:
                 param.value = iso + raw[len(raw.rstrip()):]
                 fixed += 1

@@ -60,3 +60,8 @@ def test_english_dates_become_iso():
 def test_ill_inside_link_label():
     out, _ = unnest_ill_in_wikilinks("[[Steven Levitsky|{{ill|Steven Levitsky|en|Steven Levitsky}}]] thotë")
     assert out == "{{ill|Steven Levitsky|en|Steven Levitsky}} thotë"
+
+
+def test_albanian_month_only_date_restored_to_english():
+    out, n = fix_archive_dates("{{cite web|url=u|date=Dhjetor 2021|access-date=Nëntor 2022}}")
+    assert "date=December 2021|" in out and "access-date=November 2022}}" in out and n == 2
