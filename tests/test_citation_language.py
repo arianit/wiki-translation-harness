@@ -231,3 +231,12 @@ def test_convert_nested_ref_notes_to_refn_ignores_cut_definitions_and_plain_refs
     )
     assert convert_nested_ref_notes_to_refn(text).patched_wikitext == text
     assert convert_nested_ref_notes_to_refn(text).converted == []
+
+
+@pytest.mark.asyncio
+async def test_fill_missing_citation_languages_respects_lang_alias():
+    text = "{{Cite book|title=This is quite clearly written in English prose|lang=en}}"
+    async with httpx.AsyncClient() as client:
+        result = await fill_missing_citation_languages(text, client)
+    assert result.patched_wikitext == text
+    assert result.attempted == 0

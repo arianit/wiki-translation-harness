@@ -283,3 +283,17 @@ async def test_client_effort_attribute_forwarded_to_run_claude_cli(monkeypatch):
     assert captured_kwargs["effort"] == "medium"
 
 
+
+
+def test_timeout_log_decodes_bytes_output(tmp_path):
+    import subprocess
+    from unittest.mock import patch
+
+    from wiki_translation_harness.claude_code_client import run_claude_cli as run
+
+    exc = subprocess.TimeoutExpired(cmd=["claude"], timeout=1, output=b"partial \xc3\xab", stderr=b"err")
+    with patch("wiki_translation_harness.claude_code_client.subprocess.run", side_effect=exc):
+        result = run("system", "user", model="claude-sonnet-5", log_dir=tmp_path)
+    assert result.is_error
+    log = next(tmp_path.iterdir()).read_text(encoding="utf-8")
+    assert "partial ë" in log and "b'" not in log

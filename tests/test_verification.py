@@ -343,3 +343,30 @@ def test_verified_facts_block_notable_not_found_link():
     assert "likely a real, distinct topic" in block
 
 
+
+
+@pytest.mark.asyncio
+async def test_count_other_language_sitelinks_skips_non_wikipedia_sites():
+    with respx.mock() as mock:
+        mock.get(url__startswith=WIKIDATA_API).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "entities": {
+                        "Q93189": {
+                            "sitelinks": {
+                                "enwiki": {"site": "enwiki", "title": "Egg"},
+                                "dewiki": {"site": "dewiki", "title": "Ei"},
+                                "commonswiki": {"site": "commonswiki", "title": "Category:Eggs"},
+                                "specieswiki": {"site": "specieswiki", "title": "Egg"},
+                            }
+                        }
+                    },
+                    "success": 1,
+                },
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            verifier = WikidataVerifier(client, "en", "sq")
+            result = await verifier.count_other_language_sitelinks(["Egg"])
+    assert result == {"Egg": 1}

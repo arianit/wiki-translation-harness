@@ -44,3 +44,13 @@ def test_merge_usage_from_sums_tokens_cost_and_per_model_breakdown():
     assert total.model_usage["strong-model"].calls == 1
 
 
+
+
+def test_usage_limit_needs_whole_words():
+    from wiki_translation_harness.models import looks_like_usage_limit
+
+    assert looks_like_usage_limit("HTTP 429 Too Many Requests")
+    assert looks_like_usage_limit("You've hit your usage limit")
+    assert looks_like_usage_limit("rate_limit_exceeded")
+    assert not looks_like_usage_limit("parse error at line 1429")
+    assert not looks_like_usage_limit("wrote 14290 tokens")

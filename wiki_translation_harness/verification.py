@@ -270,7 +270,10 @@ class WikidataVerifier:
                 source_link = sitelinks.get(self.source_site)
                 if not source_link:
                     continue
-                wiki_editions = sum(1 for site in sitelinks if site.endswith("wiki") and site != self.source_site)
+                wiki_editions = sum(
+                    1 for site in sitelinks
+                    if site.endswith("wiki") and site != self.source_site and site not in _NON_EDITION_WIKIS
+                )
                 by_normalized[source_link["title"]] = wiki_editions
 
         results: dict[str, int] = {}
@@ -279,6 +282,14 @@ class WikidataVerifier:
             if norm in by_normalized:
                 results[original] = by_normalized[norm]
         return results
+
+
+# Wikimedia projects whose Wikidata site ids also end in "wiki" but are not
+# Wikipedia language editions.
+_NON_EDITION_WIKIS = frozenset({
+    "commonswiki", "specieswiki", "metawiki", "wikidatawiki", "mediawikiwiki", "sourceswiki",
+    "incubatorwiki", "outreachwiki", "wikimaniawiki", "foundationwiki", "wikifunctionswiki",
+})
 
 
 def strip_namespace(title: str) -> str:

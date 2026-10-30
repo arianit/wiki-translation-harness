@@ -6,6 +6,7 @@ the fetch / chunk / cache / invoke-skill / validate / repair / save stages.
 
 from __future__ import annotations
 
+import re
 import time
 from enum import Enum
 from pathlib import Path
@@ -129,6 +130,17 @@ class InsufficientCreditsError(EngineError):
     Retrying the same engine won't help — pipeline.py catches this
     specifically to offer a switch to config.fallback_provider instead of
     just failing the chunk like a generic EngineError."""
+
+
+# Account/session usage-limit wording in a CLI engine's error text. Kept
+# broad because the exact wording is unconfirmed, but "429" only as a whole
+# number: a bare "429" substring also matched line numbers and token counts in
+# unrelated errors, switching the whole run to the fallback provider.
+_USAGE_LIMIT_RE = re.compile(r"rate[ _]limit|usage limit|spend limit|quota|\b429\b", re.IGNORECASE)
+
+
+def looks_like_usage_limit(text: str) -> bool:
+    return _USAGE_LIMIT_RE.search(text) is not None
 
 
 class TranslationResult(BaseModel):
