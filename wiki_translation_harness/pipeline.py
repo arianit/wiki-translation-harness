@@ -7,15 +7,13 @@ output.py. Contains no translation logic of its own.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import html
 import logging
 import re
-import time
 
 import httpx
 
-from wiki_translation_harness.cache import TranslationCache, VerificationCache, compute_key
+from wiki_translation_harness.cache import TranslationCache, VerificationCache
 from wiki_translation_harness.resume import checkpoint_input, input_key, record_attempt, unfinished_inputs
 from wiki_translation_harness.config import (
     default_model_for_provider,
@@ -92,7 +90,7 @@ from wiki_translation_harness.skill_loader import SkillContent, load_skill
 from wiki_translation_harness.source_templates import expand_italian_data_templates
 from wiki_translation_harness.sources import ArticleInput, load_article_source
 from wiki_translation_harness.statistics import StatsTracker
-from wiki_translation_harness.translator import translate_chunk
+from wiki_translation_harness.translator import chunk_cache_key, translate_chunk, translation_model
 from wiki_translation_harness.validator import format_errors, validate_wikitext
 from wiki_translation_harness.verification import (
     VerifiedFacts,
@@ -445,10 +443,9 @@ async def post_process_assembled(
 def _cache_repaired_chunk(
     cache: TranslationCache, model: str, target_lang: str, chunk: Chunk, skill: SkillContent, facts: VerifiedFacts | None
 ) -> None:
-    """Re-cache a repaired chunk under the key translate_chunk used for it."""
+    """Re-cache a repaired chunk under the key translate_chunk would use for it with `model`."""
     facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
-    facts_hash = hashlib.sha256(facts_block.encode("utf-8")).hexdigest()[:16] if facts_block else ""
-    key = compute_key(model, chunk.source_lang, target_lang, chunk.text, skill.content_hash, facts_hash)
+    key = chunk_cache_key(model, target_lang, chunk, skill, facts_block)
     cache.set(key, model, chunk.source_lang, target_lang, chunk.text, chunk.translated_text)
 
 
@@ -607,7 +604,9 @@ async def run_assembly_repair(
                         # already ran (pre-repair) when this chunk was first
                         # translated, so re-caching now with the same key
                         # overwrites that stale entry with the repaired text.
-                        _cache_repaired_chunk(cache, config.model, config.target_lang, chunk, skill, facts)
+                        _cache_repaired_chunk(
+                            cache, translation_model(config, chunk), config.target_lang, chunk, skill, facts
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Assembly-level repair failed for %r chunk %d (round %d): %s",
@@ -847,7 +846,7 @@ async def run_review_pass(
     # shipping that with a flag is worse than shipping the unreviewed text.
     clean: tuple[list[str | None], str, list[ValidationIssue]] | None = None
     if not _has_structural_error(structural_issues):
-        clean = ([c.translated_text for c in chunks], assembled, review_findings)
+        clean = ([c.translated_text for c in chunks], assembled, combined)
 
     rounds_used = 0
     while combined and rounds_used < config.review_max_repair_attempts:
@@ -898,7 +897,7 @@ async def run_review_pass(
         review_findings = await _run_review_call(assembled)
         combined = structural_issues + review_findings
         if not _has_structural_error(structural_issues):
-            clean = ([c.translated_text for c in chunks], assembled, review_findings)
+            clean = ([c.translated_text for c in chunks], assembled, combined)
 
     if _has_structural_error(structural_issues) and clean is not None:
         logger.warning(
@@ -908,7 +907,7 @@ async def run_review_pass(
         for chunk, text in zip(chunks, clean[0]):
             chunk.translated_text = text
         assembled = clean[1]
-        combined = [i for i in clean[2]]
+        combined = list(clean[2])
 
     return assembled, combined, rounds_used, removed_comments
 
@@ -1058,10 +1057,6 @@ class _Engines:
             config = self.config
             if provider is None or provider == config.provider:
                 return False
-            logger.warning(
-                "Secondary provider %r hit its limit; continuing complex/review work on %r (%s).",
-                provider, config.provider, config.model,
-            )
             updates = {}
             if resolve_complex_provider(config) == provider:
                 updates.update(complex_provider=config.provider, complex_model=config.model)
@@ -1069,7 +1064,15 @@ class _Engines:
             if self.review_provider == provider:
                 self.review_on_primary()
                 updates.update(review_provider=self.review_provider, review_model=self.review_model)
-            self.config = config.model_copy(update=updates)
+            if updates:
+                logger.warning(
+                    "Secondary provider %r hit its limit; continuing complex/review work on %r (%s).",
+                    provider, config.provider, config.model,
+                )
+                self.config = config.model_copy(update=updates)
+            # True even with nothing to move: the failed call went to an engine
+            # that is no longer in use (another worker already moved the tier,
+            # or the primary was switched), so a retry goes somewhere new.
             return True
 
     async def ensure_fallback_engine(self) -> bool:
@@ -1151,8 +1154,18 @@ class _Engines:
             # call), and aclose()'ing out from under a live request is
             # worse than leaking one now-unreferenced client for the
             # rest of the process.
+            old_client = self.llm_client
             self.llm_client, self.pricing, self.config = new_client, new_pricing, new_config
             self._fallback_switched = True
+            # A complex/review tier that shared the exhausted primary's client
+            # would otherwise keep calling it, so its retry fails the same way.
+            if self.complex_client is old_client:
+                self.complex_client, self.complex_pricing = new_client, new_pricing
+                self.config = self.config.model_copy(
+                    update={"complex_provider": target, "complex_model": new_config.model}
+                )
+            if self.review_client is old_client:
+                self.review_on_primary()
 
             logger.warning(
                 "Switched engine to provider=%r model=%r after credit exhaustion.",
@@ -1287,12 +1300,12 @@ class _ArticleRunner:
     async def process_article(
         self, original: ArticleInput, source: ArticleSource, chunks: list[Chunk], facts: VerifiedFacts
     ) -> None:
-        config, stats = self.config, self.stats
-        checkpoint_input(config, ArticleInput(
+        stats = self.stats
+        checkpoint_input(self.config, ArticleInput(
             title=source.title, local_path=original.local_path,
             source_lang=source.source_lang,
         ))
-        record_attempt(config, source.title)
+        record_attempt(self.config, source.title)
 
         if not await self._translate_chunks(source, chunks, facts):
             return
@@ -1305,7 +1318,7 @@ class _ArticleRunner:
             self.citation_client, stats, self.on_retry, self.cache, facts, self.qa_skill,
         )
 
-        config = self.config
+        config = self.config  # read after repair: a provider switch replaces it
         warning_findings = (
             combined_issues
             if combined_issues
@@ -1367,10 +1380,8 @@ class _ArticleRunner:
         article_stats = {
             'input_tokens': 0,
             'output_tokens': 0,
-            'start_time': time.monotonic(),
             'chunks_done': 0,
             'failed': False,
-            'limit_exceeded': False,
         }
 
         if config.glossary and len(chunks) > 1 and any(c.status == ChunkStatus.PENDING for c in chunks):
@@ -1502,7 +1513,6 @@ class _ArticleRunner:
                     "Article %r token ratio exceeded: output/input = %.2f > %.2f",
                     source.title, ratio, config.max_token_ratio
                 )
-                article_stats['limit_exceeded'] = True
                 raise ArticleLimitExceeded(f"Token ratio {ratio:.2f} exceeds limit {config.max_token_ratio}")
         # Check total token limit
         if config.max_article_tokens > 0:
@@ -1512,7 +1522,6 @@ class _ArticleRunner:
                     "Article %r total tokens exceeded: %d > %d",
                     source.title, total_tokens, config.max_article_tokens
                 )
-                article_stats['limit_exceeded'] = True
                 raise ArticleLimitExceeded(f"Total tokens {total_tokens} exceeds limit {config.max_article_tokens}")
 
     async def _review(
@@ -1549,7 +1558,8 @@ class _ArticleRunner:
                 if switched:
                     # A failed review may already have repaired chunks.
                     assembled, _ = await post_process_assembled(
-                        assemble_chunks(chunks), source.title, source.wikitext, self.config, self.citation_client,
+                        assemble_chunks(chunks), source.title, "\n".join(c.text for c in chunks), self.config,
+                        self.citation_client,
                         target_mw_client, source.source_lang,
                     )
                     continue
