@@ -53,8 +53,8 @@ def test_missing_excerpt_becomes_ill_hatnote():
 def test_english_dates_become_iso():
     t = "{{cite web|date=February 2019|access-date=27 November 2025|archive-date=Jan 5, 2020|url=u}}"
     out, n = fix_archive_dates(t)
-    assert "date=2019-02|" in out and "access-date=2025-11-27|" in out and "archive-date=2020-01-05|" in out
-    assert n == 3
+    assert "date=February 2019|" in out and "access-date=2025-11-27|" in out and "archive-date=2020-01-05|" in out
+    assert n == 2
 
 
 def test_ill_inside_link_label():

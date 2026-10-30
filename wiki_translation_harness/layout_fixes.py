@@ -24,7 +24,6 @@ _HEADING_RE = re.compile(r"^=+[^=\n](?:.*[^=\n])?=+[ \t]*$")
 _WAYBACK_RE = re.compile(r"web\.archive\.org/web/(\d{4})(\d{2})(\d{2})\d*")
 _EN_DMY_RE = re.compile(r"^\s*(\d{1,2})\s+([A-Za-z]+)\.?,?\s+(\d{4})\s*$")
 _EN_MDY_RE = re.compile(r"^\s*([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})\s*$")
-_EN_MY_RE = re.compile(r"^\s*([A-Za-z]+)\.?,?\s+(\d{4})\s*$")
 _EN_MONTHS = {
     m[:3]: i + 1
     for i, m in enumerate(
@@ -39,7 +38,8 @@ def _month(name: str) -> int | None:
 
 
 def _iso_from_english(value: str) -> str | None:
-    """'22 February 2024' / 'February 22, 2024' / 'Feb 2024' -> ISO, else None."""
+    """'22 February 2024' / 'February 22, 2024' -> ISO, else None. Month-only
+    dates ('Feb 2024') are left alone: a bare YYYY-MM crashes sqwiki's CS1."""
     if m := _EN_DMY_RE.match(value):
         d, mon, y = m.groups()
         if _month(mon):
@@ -48,10 +48,6 @@ def _iso_from_english(value: str) -> str | None:
         mon, d, y = m.groups()
         if _month(mon):
             return f"{y}-{_month(mon):02d}-{int(d):02d}"
-    if m := _EN_MY_RE.match(value):
-        mon, y = m.groups()
-        if _month(mon):
-            return f"{y}-{_month(mon):02d}"
     return None
 
 
