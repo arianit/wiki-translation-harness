@@ -289,6 +289,27 @@ async def test_repaired_chunk_is_re_cached(tmp_path: Path):
         cache.close()
 
 
+@pytest.mark.asyncio
+async def test_repaired_chunk_is_re_cached_under_translation_key(tmp_path: Path):
+    # The verified-facts block in the key grows while the article is
+    # translated (established ill renderings), so the repair must reuse the
+    # key translate_chunk actually read rather than recompute it.
+    chunk = _chunk("{{harvc|last=Smith}}")
+    chunk.cache_key = "key-translate-chunk-used"
+    client = FakeOpenRouterClient(["{{Cite book|last=Smith}}"])
+    cache = TranslationCache(tmp_path / "cache.sqlite3")
+    try:
+        await run_assembly_repair(
+            [chunk], _FakeSource(), _config(max_assembly_repair_rounds=3), client, _skill(), None,
+            FakeMediaWikiClient(raise_if_called=True), None, RunStats(),
+            cache=cache, facts=VerifiedFacts(),
+        )
+        assert cache.get("key-translate-chunk-used") == chunk.translated_text
+        assert "harvc" not in chunk.translated_text
+    finally:
+        cache.close()
+
+
 # run_review_pass: the semantic-fidelity review pass (review.py), run once
 # run_assembly_repair above has already passed clean. The same
 # FakeOpenRouterClient drives both the review call (JSON findings) and any

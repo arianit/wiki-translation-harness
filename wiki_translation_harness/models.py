@@ -67,6 +67,11 @@ class Chunk(BaseModel):
     status: ChunkStatus = ChunkStatus.PENDING
     translated_text: str | None = None
     is_complex: bool = False
+    # The translation-cache key translate_chunk read and wrote this chunk
+    # under. A later repair re-caches under this exact key: recomputing it
+    # would not match, since the verified-facts block it hashes grows as
+    # chunks record their renderings (VerifiedFacts.established_renderings).
+    cache_key: str | None = None
 
     @property
     def section_title(self) -> str:

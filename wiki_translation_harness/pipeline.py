@@ -90,7 +90,12 @@ from wiki_translation_harness.skill_loader import SkillContent, load_skill
 from wiki_translation_harness.source_templates import expand_italian_data_templates
 from wiki_translation_harness.sources import ArticleInput, load_article_source
 from wiki_translation_harness.statistics import StatsTracker
-from wiki_translation_harness.translator import chunk_cache_key, translate_chunk, translation_model
+from wiki_translation_harness.translator import (
+    chunk_cache_key,
+    is_complex_routed,
+    translate_chunk,
+    translation_model,
+)
 from wiki_translation_harness.validator import format_errors, validate_wikitext
 from wiki_translation_harness.verification import (
     VerifiedFacts,
@@ -441,12 +446,16 @@ async def post_process_assembled(
 
 
 def _cache_repaired_chunk(
-    cache: TranslationCache, model: str, target_lang: str, chunk: Chunk, skill: SkillContent, facts: VerifiedFacts | None
+    cache: TranslationCache, config: Config, chunk: Chunk, skill: SkillContent, facts: VerifiedFacts | None
 ) -> None:
-    """Re-cache a repaired chunk under the key translate_chunk would use for it with `model`."""
-    facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
-    key = chunk_cache_key(model, target_lang, chunk, skill, facts_block)
-    cache.set(key, model, chunk.source_lang, target_lang, chunk.text, chunk.translated_text)
+    """Re-cache a repaired chunk under the key translate_chunk read it under
+    (chunk.cache_key), so a rerun's cache lookup gets the repaired text."""
+    model = translation_model(config, chunk)
+    key = chunk.cache_key
+    if key is None:
+        facts_block = build_verified_facts_block(chunk.text, facts) if facts else ""
+        key = chunk_cache_key(model, config.target_lang, chunk, skill, facts_block)
+    cache.set(key, model, chunk.source_lang, config.target_lang, chunk.text, chunk.translated_text)
 
 
 async def run_assembly_repair(
@@ -604,9 +613,7 @@ async def run_assembly_repair(
                         # already ran (pre-repair) when this chunk was first
                         # translated, so re-caching now with the same key
                         # overwrites that stale entry with the repaired text.
-                        _cache_repaired_chunk(
-                            cache, translation_model(config, chunk), config.target_lang, chunk, skill, facts
-                        )
+                        _cache_repaired_chunk(cache, config, chunk, skill, facts)
                 except Exception as exc:
                     logger.warning(
                         "Assembly-level repair failed for %r chunk %d (round %d): %s",
@@ -877,7 +884,7 @@ async def run_review_pass(
                 stats.review_corrections_applied += 1
                 chunk.translated_text = repair_result.text
                 if cache is not None:
-                    _cache_repaired_chunk(cache, review_model, config.target_lang, chunk, skill, facts)
+                    _cache_repaired_chunk(cache, config, chunk, skill, facts)
             except InsufficientCreditsError:
                 raise
             except Exception as exc:
@@ -1394,11 +1401,19 @@ class _ArticleRunner:
                 logger.warning("Glossary for %r failed, translating without it: %s", source.title, exc)
 
         # Execute chunk translation with overall article timeout
+        tasks = [
+            asyncio.ensure_future(self._translate_chunk(source, chunks, c, facts, article_stats)) for c in chunks
+        ]
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*(self._translate_chunk(source, chunks, c, facts, article_stats) for c in chunks)),
-                timeout=self.config.article_timeout_s,
-            )
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=self.config.article_timeout_s)
+            finally:
+                # gather() leaves the other chunks running when one raises
+                # (ArticleLimitExceeded, an unexpected error): stop them, so a
+                # failed article spends no more tokens or worker slots.
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.TimeoutError:
             logger.error(
                 "Article %r translation timed out after %.1f seconds",
@@ -1445,8 +1460,7 @@ class _ArticleRunner:
             for engine_attempt in range(2):  # 1 retry, only after a fallback-provider switch
                 config = self.config
                 attempted_provider = (
-                    resolve_complex_provider(config)
-                    if config.complex_model and chunk.is_complex else config.provider
+                    resolve_complex_provider(config) if is_complex_routed(config, chunk) else config.provider
                 )
                 try:
                     outcome = await translate_chunk(
@@ -1556,7 +1570,9 @@ class _ArticleRunner:
                         engines.review_on_primary()
                         switched = True
                 if switched:
-                    # A failed review may already have repaired chunks.
+                    # A failed review may already have repaired chunks, and
+                    # a repair call is where the model leaves its own notes.
+                    removed_comments.extend(reconcile_chunk_comments(chunks))
                     assembled, _ = await post_process_assembled(
                         assemble_chunks(chunks), source.title, "\n".join(c.text for c in chunks), self.config,
                         self.citation_client,

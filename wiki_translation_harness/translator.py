@@ -135,10 +135,15 @@ class ChunkOutcome:
     latency_s: float = 0.0
 
 
+def is_complex_routed(config: Config, chunk: Chunk) -> bool:
+    """Hybrid-model routing: complex chunks go to the complex tier
+    (config.complex_model) when one is configured."""
+    return bool(config.complex_model) and chunk.is_complex
+
+
 def translation_model(config: Config, chunk: Chunk) -> str:
-    """The model translate_chunk sends this chunk to (hybrid-model routing:
-    complex chunks go to config.complex_model when one is configured)."""
-    return config.complex_model if config.complex_model and chunk.is_complex else config.model
+    """The model translate_chunk sends this chunk to."""
+    return config.complex_model if is_complex_routed(config, chunk) else config.model
 
 
 def chunk_cache_key(model: str, target_lang: str, chunk: Chunk, skill: SkillContent, facts_block: str) -> str:
@@ -169,13 +174,14 @@ async def translate_chunk(
     # Hybrid-model routing: complex chunks use complex_model (and, when the
     # caller passed one, a distinct complex_client -- see
     # engines.build_client_pool/config.resolve_complex_provider) when configured.
-    is_complex_routed = bool(config.complex_model) and chunk.is_complex
+    complex_routed = is_complex_routed(config, chunk)
     effective_model = translation_model(config, chunk)
-    effective_pricing = complex_pricing if is_complex_routed else pricing
-    effective_client = complex_client if (is_complex_routed and complex_client is not None) else client
+    effective_pricing = complex_pricing if complex_routed else pricing
+    effective_client = complex_client if (complex_routed and complex_client is not None) else client
     facts_block = build_verified_facts_block(chunk.text, verified_facts) if verified_facts else ""
 
     key = chunk_cache_key(effective_model, config.target_lang, chunk, skill, facts_block)
+    chunk.cache_key = key
 
     cached_text = cache.get(key) if cache is not None else None
     if cached_text is not None:
