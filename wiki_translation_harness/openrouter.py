@@ -199,7 +199,14 @@ class OpenRouterClient:
         choices = data.get("choices") or []
         if not choices:
             raise OpenRouterError(f"OpenRouter response had no choices: {data}")
-        text = choices[0]["message"]["content"]
+        text = (choices[0].get("message") or {}).get("content")
+        if text is None:
+            # A null content (refusal, content filter, reasoning-only reply)
+            # is an engine failure, not a crash in run_completion's .strip().
+            raise OpenRouterError(
+                f"OpenRouter response had no message content "
+                f"(finish_reason={choices[0].get('finish_reason')!r}): {str(data)[:500]}"
+            )
         usage = data.get("usage") or {}
         if usage_out is not None:
             usage_out.update(usage)

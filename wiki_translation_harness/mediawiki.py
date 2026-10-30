@@ -53,9 +53,15 @@ class MediaWikiClient:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
-    async def fetch_article(self, title: str, revid: int | None = None) -> ArticleSource:
+    async def fetch_article(
+        self, title: str, revid: int | None = None, follow_redirects: bool = False
+    ) -> ArticleSource:
         """Fetch raw wikitext + revid/timestamp for a single title via action=query.
-        With `revid`, fetches that exact revision instead of the current one."""
+        With `revid`, fetches that exact revision instead of the current one.
+        With `follow_redirects`, a redirect resolves to its target page (the
+        returned title is the target's) instead of its own `#REDIRECT` text.
+        Off by default: source articles are saved, locked and checked as done
+        under the requested title, so a source fetch must not rename it."""
         params = {
             "action": "query",
             "prop": "revisions",
@@ -65,6 +71,10 @@ class MediaWikiClient:
             "formatversion": "2",
             "format": "json",
         }
+        if follow_redirects and not revid:
+            # Not with revids: resolving there would swap the pinned revision
+            # for the redirect target's current one.
+            params["redirects"] = "1"
         resp = await asyncio.wait_for(
             self._client.get(self.api_url, params=params), timeout=self._hard_timeout
         )

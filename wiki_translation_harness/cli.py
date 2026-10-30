@@ -90,13 +90,10 @@ def _build_overrides(
     }
     overrides = {k: v for k, v in overrides.items() if v is not None}
     if base_url is not None:
-        # Applies to whichever provider ends up active for this run.
-        effective_provider = provider or "openrouter"
-        key = {
-            "local": "local_base_url",
-            "experiential": "experiential_base_url",
-        }.get(effective_provider, "openrouter_base_url")
-        overrides[key] = base_url
+        # Applies to whichever provider ends up active for this run, which
+        # may come from config.yaml rather than --provider -- build_config
+        # routes it once the provider is known.
+        overrides["base_url"] = base_url
     return overrides
 
 
@@ -372,7 +369,6 @@ def benchmark(
     
     results = benchmark_data["results"]
     source_title = benchmark_data["source_title"]
-    source_wikitext = benchmark_data["source_wikitext"]
     translations = benchmark_data["translations"]
     evaluation_result = benchmark_data["evaluation"]
     
@@ -382,7 +378,7 @@ def benchmark(
             f"  {m}: {r['runtime_s']:.1f}s, in={r['tokens_in']} out={r['tokens_out']} "
             f"tokens, cost=${r['estimated_cost_usd']:.4f}, failed_sections={r['failed_sections']}"
         )
-    console.print(f"Full report: {output / (source_title.replace(' ', '_') + '_benchmark.json')}")
+    console.print(f"Full report: {output / (sanitize_filename(source_title) + '_benchmark.json')}")
     
     if evaluation_result:
         # Create article subdirectory
@@ -508,10 +504,6 @@ def queue(
     _print_model_usage(stats)
 
 
-if __name__ == "__main__":
-    app()
-
-
 @app.command()
 def review(
     titles: Optional[list[str]] = typer.Option(
@@ -548,11 +540,15 @@ def review(
     else:
         todo = []
         for _, url in unreviewed_done_lines(queue_repo_dir, draft_engine):
-            _, title = parse_source_ref(url)
+            lang, title = parse_source_ref(url)
             if title.replace("_", " ") in {e.replace("_", " ") for e in exclude or []}:
                 continue
-            urls[title] = url
-            todo.append(title)
+            # Keep the line's source language: rereview fetches the source
+            # from it, and a non-default-language article reviewed against
+            # the default wiki would be compared with a different text.
+            ref = f"{lang}:{title}" if lang else title
+            urls[ref] = url
+            todo.append(ref)
     if not todo:
         console.print("Nothing to review.")
         return
@@ -574,3 +570,7 @@ def review(
         )
     console.print(f"Estimated cost: ${stats_tracker.stats.estimated_cost_usd:.4f}.")
     _print_model_usage(stats_tracker.stats)
+
+
+if __name__ == "__main__":
+    app()

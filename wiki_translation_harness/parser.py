@@ -17,6 +17,13 @@ from wiki_translation_harness.models import Chunk, Section
 _ENCODING = tiktoken.get_encoding("cl100k_base")
 
 _LIST_LINE_RE = re.compile(r"^[ \t]*[*#:;]+")
+# Tags whose body can span blank lines (stanzas, code, quoted paragraphs) and
+# would be left unbalanced in both chunks if a paragraph boundary inside them
+# became a chunk boundary.
+_UNSPLITTABLE_TAGS = frozenset(
+    {"table", "ref", "math", "chem", "poem", "gallery", "pre", "nowiki", "syntaxhighlight",
+     "source", "timeline", "blockquote", "score", "graph", "mapframe"}
+)
 _BLANK_LINE_SPLIT_RE = re.compile(r"(\n[ \t]*\n)")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])(\s+)")
 
@@ -70,7 +77,8 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 def _find_protected_spans(text: str) -> list[tuple[int, int]]:
     """Char ranges that must never be split: templates/parser-functions,
-    tables, and <ref> tags (via mwparserfromhell), plus contiguous list
+    HTML comments, tables, <ref> and other block tags whose body can hold
+    blank lines (via mwparserfromhell), plus contiguous list
     blocks (via line-based regex, since mwparserfromhell only tags the
     bullet marker itself, not the whole list line/run)."""
     spans: list[tuple[int, int]] = []
@@ -80,11 +88,13 @@ def _find_protected_spans(text: str) -> list[tuple[int, int]]:
     for node in code.nodes:
         s = str(node)
         node_type = type(node).__name__
-        if node_type == "Template":
+        if node_type in ("Template", "Comment"):
+            # A commented-out passage often spans blank lines; cut there, one
+            # chunk carries an unclosed <!-- and the next a stray -->.
             spans.append((offset, offset + len(s)))
         elif node_type == "Tag":
             tag_name = str(getattr(node, "tag", "")).lower()
-            if tag_name in ("table", "ref"):
+            if tag_name in _UNSPLITTABLE_TAGS:
                 spans.append((offset, offset + len(s)))
             elif tag_name == "references" and node.contents is not None:
                 # A list-defined <references> block is one top-level node,
@@ -169,15 +179,15 @@ def _split_oversized_section(text: str, chunk_min: int, chunk_max: int) -> list[
     chunk_max."""
     # Re-derive units with paragraph-level fallback now sized against chunk_max.
     protected_spans = _find_protected_spans(text)
-    units: list[tuple[str, bool]] = []
+    units: list[str] = []
     pos = 0
     for start, end in protected_spans:
         if start > pos:
-            units.extend((u, False) for u in _split_free_text(text[pos:start], chunk_max))
-        units.append((text[start:end], True))
+            units.extend(_split_free_text(text[pos:start], chunk_max))
+        units.append(text[start:end])
         pos = end
     if pos < len(text):
-        units.extend((u, False) for u in _split_free_text(text[pos:], chunk_max))
+        units.extend(_split_free_text(text[pos:], chunk_max))
 
     chunks: list[str] = []
     buf: list[str] = []
@@ -190,7 +200,7 @@ def _split_oversized_section(text: str, chunk_min: int, chunk_max: int) -> list[
             buf = []
             buf_tokens = 0
 
-    for unit_text, is_protected in units:
+    for unit_text in units:
         t = estimate_tokens(unit_text)
         if t > chunk_max:
             # oversized on its own (a huge template/table/ref/list, or a

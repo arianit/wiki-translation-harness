@@ -412,24 +412,23 @@ async def _check_existing_article(
         existing_target_title = (await verifier.check_sitelinks([article_title])).get(article_title)
         sibling_links = []
 
-    # Wikidata sitelinks are not complete.  Check the target wiki directly as
-    # well, following redirects, so an existing same-title article is caught
-    # even when its Wikidata item is missing or incomplete.
+    # Wikidata sitelinks are not complete.  When Wikidata names no target
+    # article, check the target wiki directly for a same-title page
+    # (fetch_article follows redirects), so an existing article is caught even
+    # when its Wikidata item is missing or incomplete.  A sitelink, when there
+    # is one, stays authoritative: a same-title page can be a different topic.
+    existing_target_bytes: int | None = None
     if target_mw_client is not None:
         try:
-            direct_target = await target_mw_client.fetch_article(article_title)
-            existing_target_title = direct_target.title
+            existing_source = await target_mw_client.fetch_article(
+                existing_target_title or article_title, follow_redirects=True
+            )
         except MediaWikiError:
-            pass
-
-    existing_target_bytes: int | None = None
-    if existing_target_title and target_mw_client is not None:
-        try:
-            existing_source = await target_mw_client.fetch_article(existing_target_title)
+            existing_source = None
+        if existing_source is not None:
+            existing_target_title = existing_source.title
             existing_target_bytes = len(existing_source.wikitext.encode("utf-8"))
             sibling_links = extract_link_targets(existing_source.wikitext)[:_MAX_SIBLING_LINKS_REPORTED]
-        except MediaWikiError:
-            pass
 
     if cache is not None:
         cache.set_sibling_links(source_lang, target_lang, article_title, existing_target_title, sibling_links)
@@ -501,7 +500,7 @@ async def verify_wikitext(
                     template_params[source_name] = cached_params
                 continue
             try:
-                target_source = await target_mw_client.fetch_article(target_full_title)
+                target_source = await target_mw_client.fetch_article(target_full_title, follow_redirects=True)
             except MediaWikiError:
                 if cache:
                     cache.set_template_params(source_lang, target_lang, source_name, target_full_title, [])
