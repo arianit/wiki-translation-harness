@@ -44,3 +44,13 @@ def test_pairing_skips_source_hatnotes_the_model_already_rewrote():
     patched, converted = _run(text, source, set())
     assert patched.endswith("{{Hatnote|Lexo më tepër: {{ill|Kritika|en|Critique}} dhe {{ill|Ekonomia|en|Marxian economics}}}}")
     assert converted == ["Kritika", "Ekonomia"]
+
+
+def test_target_already_written_as_ill_is_not_double_wrapped():
+    # Regression (Poverty): {{Shih|{{ill|..}}}} rendered "[[Slums [en]]] [en]".
+    text = "{{Shiko gjithashtu|{{ill|Lagjet e varfra|en|Slums}}|Fëmijët}}"
+    patched, converted = _run(text, "{{See also|Slums|Street children}}", set())
+    assert patched == (
+        "{{Hatnote|Shih edhe: {{ill|Lagjet e varfra|en|Slums}} dhe {{ill|Fëmijët|en|Street children}}}}"
+    )
+    assert converted == ["Fëmijët"]

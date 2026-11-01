@@ -60,7 +60,7 @@ async def add_ill_to_hatnotes(
         source_calls.setdefault(kind, []).append(_positional(tmpl))
 
     calls = _calls(text, _TARGET_KIND)
-    titles = sorted({t for _, tmpl in calls for t in _positional(tmpl)})
+    titles = sorted({t for _, tmpl in calls for t in _positional(tmpl) if "{{" not in t})
     if not titles:
         return text, []
     present = await exists(titles)
@@ -79,12 +79,17 @@ async def add_ill_to_hatnotes(
         if match is None:
             continue
         cursor[kind] = match + 1
-        if all(present.get(t, True) for t in targets):
+        # A target the model already wrote as {{ill|..}} would be double-wrapped
+        # by {{Shih}}/{{Kryesor}} ("[[Slums [en]]] [en]"), so it needs the
+        # {{Hatnote}} form too; it is used as the link itself.
+        if all(present.get(t, True) and "{{" not in t for t in targets):
             continue
         originals = pool[match]
         links = []
         for target, original in zip(targets, originals):
-            if present.get(target, True):
+            if "{{" in target:
+                links.append(target)
+            elif present.get(target, True):
                 links.append(f"[[{target}]]")
             else:
                 links.append(f"{{{{ill|{target}|{source_lang}|{original}}}}}")
