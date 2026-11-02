@@ -1,3 +1,3 @@
 """wiki-translation-harness: batch enwiki -> sqwiki translation harness (orchestration only)."""
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
