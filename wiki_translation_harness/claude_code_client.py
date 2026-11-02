@@ -18,14 +18,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
+import re
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wiki_translation_harness.models import EngineError, InsufficientCreditsError, ModelPricing
 from wiki_translation_harness.openrouter import RetryCallback
@@ -73,6 +77,61 @@ class ClaudeCodeSessionLimitError(ClaudeCodeError, InsufficientCreditsError):
     engine that's guaranteed to keep rejecting them. Still a ClaudeCodeError
     too, so existing `except ClaudeCodeError` / `pytest.raises(ClaudeCodeError)`
     call sites keep working unchanged."""
+
+
+_RESET_RE = re.compile(
+    r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?:\s*\(([^)]+)\))?", re.IGNORECASE
+)
+# Don't sleep longer than this (a 5-hour window never needs more); a longer
+# implied wait means the parse is wrong, so fall back to raising.
+_MAX_LIMIT_WAIT_S = 6 * 3600
+_LIMIT_MARGIN_S = 90
+
+_limit_wait_until: float = 0.0  # monotonic deadline shared by concurrent callers
+_logger = logging.getLogger(__name__)
+
+
+def seconds_until_limit_reset(text: str, now: datetime | None = None) -> float | None:
+    """Seconds until the reset time named in a usage-limit message such as
+    "You've hit your 5-hour limit · resets 1:10am (Europe/Tirane)", or None
+    if the text names no reset time (e.g. a monthly spend limit) or the wait
+    would be implausibly long."""
+    m = _RESET_RE.search(text or "")
+    if not m:
+        return None
+    hour, minute, ampm, tzname = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower(), m.group(4)
+    if not 1 <= hour <= 12:
+        return None
+    hour = hour % 12 + (12 if ampm == "pm" else 0)
+    try:
+        tz = ZoneInfo(tzname.strip()) if tzname else None
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = None
+    now = now or datetime.now(tz)
+    if tz is not None:
+        now = now.astimezone(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    wait = (target - now).total_seconds() + _LIMIT_MARGIN_S
+    return wait if wait <= _MAX_LIMIT_WAIT_S else None
+
+
+async def _wait_for_limit_reset(wait_s: float, message: str) -> None:
+    """Sleep until the limit resets. Concurrent callers share one deadline so
+    they log once and all wake together."""
+    global _limit_wait_until
+    loop_now = time.monotonic()
+    deadline = loop_now + wait_s
+    if deadline > _limit_wait_until + 60:
+        _limit_wait_until = deadline
+        _logger.warning(
+            "Claude Code usage limit hit (%s). Waiting %.0f min until it resets, then retrying.",
+            message.strip(), wait_s / 60,
+        )
+    remaining = _limit_wait_until - time.monotonic()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
 
 @dataclass
@@ -407,6 +466,15 @@ class ClaudeCodeClient:
                 # A missing binary won't fix itself on retry.
                 raise ClaudeCodeError(result.stderr)
             if result.raw.get("api_error_status") == 429:
+                wait_s = seconds_until_limit_reset(result.stderr)
+                if wait_s is not None:
+                    # A windowed (e.g. 5-hour) limit with a stated reset
+                    # time: sleep until then and retry this same call rather
+                    # than failing every remaining chunk. Doesn't consume
+                    # the retry budget.
+                    await _wait_for_limit_reset(wait_s, result.stderr)
+                    attempt -= 1
+                    continue
                 # An account/org-level rate or spend limit (confirmed live:
                 # "You've hit your monthly spend limit", five_hour rate
                 # window, overage rejected) -- unlike a transient service

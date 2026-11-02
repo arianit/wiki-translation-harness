@@ -39,6 +39,10 @@ from wiki_translation_harness.mediawiki import MediaWikiClient, MediaWikiClientP
 from wiki_translation_harness.layout_fixes import (
     blank_line_before_headings,
     fix_archive_dates,
+    expand_age_templates,
+    fix_as_of,
+    fix_cs1_agency,
+    fix_wayback_urls,
     replace_missing_excerpts,
     unnest_ill_in_wikilinks,
 )
@@ -386,12 +390,30 @@ async def post_process_assembled(
     text, unnested = unnest_ill_in_wikilinks(text)
     if unnested:
         logger.info("Unnested %d {{ill}} from inside a wikilink in %r", unnested, source_title)
+    text, wayback = fix_wayback_urls(text)
+    if wayback:
+        logger.info("Repaired %d malformed Wayback URL(s) in %r", wayback, source_title)
+    try:
+        text, agencies = fix_cs1_agency(text)
+        if agencies:
+            logger.info("Folded |agency= into |publisher= in %d citation(s) of %r", agencies, source_title)
+    except Exception as exc:
+        logger.warning("agency fix failed for %r: %s", source_title, exc)
     try:
         text, dates_fixed = fix_archive_dates(text)
         if dates_fixed:
             logger.info("Fixed %d |archive-date= value(s) in %r", dates_fixed, source_title)
     except Exception as exc:
         logger.warning("archive-date fix failed for %r: %s", source_title, exc)
+    try:
+        text, as_of_fixed = fix_as_of(text)
+        if as_of_fixed:
+            logger.info("Normalised %d {{As of}} call(s) in %r", as_of_fixed, source_title)
+    except Exception as exc:
+        logger.warning("As of fix failed for %r: %s", source_title, exc)
+    text, ages = expand_age_templates(text)
+    if ages:
+        logger.info("Expanded %d {{Age in years and days}} call(s) in %r", ages, source_title)
     text, headings_spaced = blank_line_before_headings(text)
     if headings_spaced:
         logger.info("Added a blank line before %d heading(s) in %r", headings_spaced, source_title)
