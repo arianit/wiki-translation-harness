@@ -297,3 +297,48 @@ def test_timeout_log_decodes_bytes_output(tmp_path):
     assert result.is_error
     log = next(tmp_path.iterdir()).read_text(encoding="utf-8")
     assert "partial ë" in log and "b'" not in log
+
+
+def test_seconds_until_limit_reset_parses_five_hour_message():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from wiki_translation_harness.claude_code_client import seconds_until_limit_reset
+
+    now = datetime(2026, 11, 1, 23, 57, tzinfo=ZoneInfo("Europe/Tirane"))
+    wait = seconds_until_limit_reset(
+        "You've hit your 5-hour limit · resets 1:10am (Europe/Tirane)", now=now
+    )
+    assert wait == pytest.approx(73 * 60 + 90)
+    assert seconds_until_limit_reset("You've hit your monthly spend limit") is None
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_with_reset_time_waits_and_retries(monkeypatch):
+    calls = []
+
+    def fake_run(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            return ClaudeCLIResult(
+                is_error=True, model_used="m",
+                stderr="You've hit your 5-hour limit · resets 1:10am (Europe/Tirane)",
+                raw={"api_error_status": 429},
+            )
+        return ClaudeCLIResult(is_error=False, model_used="m", result_text="ok",
+                               input_tokens=1, output_tokens=1)
+
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr("wiki_translation_harness.claude_code_client.run_claude_cli", fake_run)
+    monkeypatch.setattr("wiki_translation_harness.claude_code_client.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "wiki_translation_harness.claude_code_client.seconds_until_limit_reset", lambda *_: 600.0
+    )
+    client = ClaudeCodeClient(model="m", max_retries=0)
+    text, _, _ = await client.chat_completion("m", _MESSAGES)
+    assert text == "ok"
+    assert len(calls) == 2 and slept and slept[0] > 0
