@@ -277,6 +277,17 @@ def fix_cs1_agency(text: str) -> tuple[str, int]:
     return str(code), fixed
 
 
+_REDIRECT_HATNOTE_RE = re.compile(
+    r"^[ \t]*\{\{\s*redirect[\w -]*\|(?:[^{}]|\{\{[^{}]*\}\})*\}\}[ \t]*\n?", re.IGNORECASE | re.MULTILINE
+)
+
+
+def remove_redirect_hatnotes(text: str) -> tuple[str, int]:
+    """sqwiki does not want {{Redirect|UN|…|UN (kthjellim)}}-style hatnotes
+    ({{Redirect}}, {{Redirect2}}, {{Redirect-distinguish}}, …); drop them."""
+    return _REDIRECT_HATNOTE_RE.subn("", text)
+
+
 _EXCERPT_RE = re.compile(r"\{\{\s*Excerpt\s*\|([^|{}]+)(?:\|[^{}]*)?\}\}", re.IGNORECASE)
 
 

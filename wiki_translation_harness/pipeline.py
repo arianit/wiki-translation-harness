@@ -43,6 +43,7 @@ from wiki_translation_harness.layout_fixes import (
     fix_as_of,
     fix_cs1_agency,
     fix_wayback_urls,
+    remove_redirect_hatnotes,
     replace_missing_excerpts,
     unnest_ill_in_wikilinks,
 )
@@ -411,6 +412,9 @@ async def post_process_assembled(
             logger.info("Normalised %d {{As of}} call(s) in %r", as_of_fixed, source_title)
     except Exception as exc:
         logger.warning("As of fix failed for %r: %s", source_title, exc)
+    text, redirects = remove_redirect_hatnotes(text)
+    if redirects:
+        logger.info("Removed %d {{Redirect}} hatnote(s) from %r", redirects, source_title)
     text, ages = expand_age_templates(text)
     if ages:
         logger.info("Expanded %d {{Age in years and days}} call(s) in %r", ages, source_title)

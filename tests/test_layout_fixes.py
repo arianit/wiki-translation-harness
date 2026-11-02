@@ -118,3 +118,14 @@ def test_agency_folded_into_publisher():
 
     out, n = fix_cs1_agency("{{cite news|title=T|agency=AFP|date=2009}}{{cite web|publisher=chinaview.cn|agency=Xinhua}}")
     assert out == "{{cite news|title=T|publisher=AFP|date=2009}}{{cite web|publisher=Xinhua; chinaview.cn}}" and n == 2
+
+
+def test_redirect_hatnotes_removed():
+    from wiki_translation_harness.layout_fixes import remove_redirect_hatnotes
+
+    src = (
+        "{{Short description|x}}\n{{Redirect|UN|përdorime të tjera|UN (kthjellim)|dhe|KB (kthjellim)}}\n"
+        "{{redirect2|A|B}}\n{{Redirect-distinguish|X|Y}}\n{{Hatnote|Shih edhe: [[Z]]}}\nTekst {{Redirectx}}"
+    )
+    out, n = remove_redirect_hatnotes(src)
+    assert out == "{{Short description|x}}\n{{Hatnote|Shih edhe: [[Z]]}}\nTekst {{Redirectx}}" and n == 3
