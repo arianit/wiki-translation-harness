@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-02
+
+### Changed
+- **`{{Redirect}}`-style hatnotes are removed from the output** (`layout_fixes.remove_redirect_hatnotes`, run in `post_process_assembled`): sqwiki does not want `{{Redirect}}`, `{{Redirect2}}`, `{{Redirect-distinguish}}` and similar whole-line hatnotes. Inline uses are left alone.
+
 ## [0.4.1] - 2026-11-02
 
 ### Added
